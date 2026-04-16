@@ -13,7 +13,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ─── Security ──────────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-local-dev-only-change-in-prod')
 DEBUG = os.environ.get('DEBUG', 'False') == 'True'
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '*').split(',')
+ALLOWED_HOSTS = ['task-manager-backend-bqae.onrender.com', '127.0.0.1', 'localhost', '*']
 
 # ─── Application definition ────────────────────────────────────────────────
 INSTALLED_APPS = [
@@ -60,7 +60,8 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-# ─── Database (SQLite for Render free tier) ────────────────────────────────
+# ─── Database (SQLite - Ephemeral for Free Tier) ───────────────────────────
+# NOTE: Without a Render Persistent Disk, data is LOST on every restart/deploy.
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
