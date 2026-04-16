@@ -58,4 +58,5 @@ urlpatterns = [
     path('user-summary/', views.get_user_summary),
     path('check-overdue/', views.check_overdue),
     path('system-check/', views.run_system_check),
+    path('pulse/', views.get_pulse),
 ]

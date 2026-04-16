@@ -46,8 +46,8 @@ class AssignmentSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'task', 'task_id', 'assigned_to', 'emp_id', 'user_id', 
             'title', 'task_title', 'task_desc', 'user_name', 
-            'priority', 'status',
-            'start_date', 'deadline', 'end_date', 'comments'
+            'priority', 'status', 'assigned_by',
+            'start_date', 'deadline', 'end_date', 'comments', 'dtm_created'
         ]
 
 class NotificationSerializer(serializers.ModelSerializer):

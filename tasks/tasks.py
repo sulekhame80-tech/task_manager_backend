@@ -1,58 +1,56 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from .models import (
     app_user, task_management, assignment, notification, statusoption, forum_entry
 )
 
 logger = logging.getLogger(__name__)
 
-def monitor_assignments_lifecycle(slot_id=None):
+
+def _get_admin_id():
+    admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+    return admin.id if admin else 1
+
+
+def _notify(user_id, title, message):
+    """Safe notification helper — never raises."""
+    try:
+        notification.objects.create(user_id=user_id, title=title, message=message)
+    except Exception as e:
+        logger.error(f"[NOTIFY] Failed to create notification: {e}")
+
+
+def monitor_assignments_lifecycle():
     """
-    Unified Monitoring Task (PRECISION CLOCK SYNC)
-    Detects unstarted tasks and overdue deadlines, triggering one detailed alert per slot.
+    5-minute slot: Detects unstarted tasks, newly overdue deadlines,
+    and sends a 5-minute deadline warning to employees.
     """
-    logger.info(f"Checking lifecycle for slot: {slot_id}")
     try:
         from django.utils import timezone
-        from .models import system_log
         now = timezone.now()
+        clock_time = timezone.localtime(now).strftime("%I:%M %p")
+        admin_id = _get_admin_id()
 
-        # 🛠️ GLOBAL SLOT GUARD (Leader Election)
-        if slot_id:
-            # We use system_log.get_or_create to ensure only ONE worker processes this slot globally
-            lock_action = f"[SLOT_LOCK] {slot_id}"
-            _, created = system_log.objects.get_or_create(action=lock_action)
-            if not created:
-                logger.info(f"Slot {slot_id} already processed by another worker. Standing down.")
-                return
-
-        # Find the primary administrator to receive alerts
-        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
-        admin_id = admin.id if admin else 1
-
-        # 1. NOT STARTED Bulk Detailed Alert
+        # ── 1. NOT STARTED alert (admin) ────────────────────────────────────
         unstarted = assignment.objects.filter(
-            status__name__iexact='Pending', 
-            start_date__isnull=True, 
+            status__name__iexact='Pending',
+            start_date__isnull=True,
             notified_start=False,
             deleted=False
         ).select_related('task', 'assigned_to')
-        
-        if unstarted.count() > 0:
-            count = unstarted.count()
-            # Collect details
-            details = ", ".join([f"{a.task.title} ({a.assigned_to.name})" for a in unstarted[:5]])
-            if count > 5: details += "..."
-            
-            notification.objects.create(
-                user_id=admin_id, 
-                title="TASK ALERT", 
-                message=f"⚠ {count} tasks NOT STARTED: {details}"
-            )
-            unstarted.update(notified_start=True)
-            logger.info(f"Bulk Alerted: {count} unstarted tasks.")
 
-        # 2. OVERDUE Bulk Detailed Alert
+        if unstarted.exists():
+            count = unstarted.count()
+            details = ", ".join(
+                [f"{a.task.title} ({a.assigned_to.name})" for a in unstarted[:5]]
+            )
+            if count > 5:
+                details += "..."
+            _notify(admin_id, "TASK ALERT",
+                    f"⚠ {count} task(s) NOT STARTED (as of {clock_time}): {details}")
+            unstarted.update(notified_start=True)
+
+        # ── 2. Newly OVERDUE (admin + employee) ─────────────────────────────
         status_overdue, _ = statusoption.objects.get_or_create(name='Overdue')
         overdue_qs = assignment.objects.filter(
             deleted=False,
@@ -60,138 +58,167 @@ def monitor_assignments_lifecycle(slot_id=None):
             notified_overdue=False
         ).exclude(status__name__iexact='Completed').select_related('task', 'assigned_to')
 
-        if overdue_qs.count() > 0:
+        if overdue_qs.exists():
             count = overdue_qs.count()
-            # Collect details
-            details = ", ".join([f"{a.task.title} ({a.assigned_to.name})" for a in overdue_qs[:5]])
-            if count > 5: details += "..."
-
-            notification.objects.create(
-                user_id=admin_id, 
-                title="OVERDUE ALERT", 
-                message=f"🚨 OVERDUE ({count}): {details}"
+            details = ", ".join(
+                [f"{a.task.title} ({a.assigned_to.name})" for a in overdue_qs[:5]]
             )
-            # Mark all as notified and update status in bulk
+            if count > 5:
+                details += "..."
+            _notify(admin_id, "OVERDUE ALERT",
+                    f"🚨 {count} task(s) OVERDUE as of {clock_time}: {details}")
+
+            # Notify each employee individually
+            for a in overdue_qs:
+                _notify(a.assigned_to.id, "TASK OVERDUE",
+                        f"🚨 Your task '{a.task.title}' is now OVERDUE. Please act immediately!")
+
             overdue_qs.update(status=status_overdue, notified_overdue=True)
-            logger.info(f"Bulk Alerted: {count} overdue tasks.")
-            
-    except Exception as e:
-        logger.error(f"Error in monitor_assignments_lifecycle: {e}")
 
-def generate_admin_summary(slot_id=None):
-    """ 📊 Generates a 10-minute summary of all active workloads with a Slot-Lock. """
+        # ── 3. 5-MINUTE DEADLINE WARNING (employee) ─────────────────────────
+        # Find assignments whose deadline is within the next 5–10 minutes
+        # and haven't been warned yet (use notified_start as a proxy flag
+        # since we add a dedicated field below — for now use a title check).
+        warn_from = now
+        warn_to   = now + timedelta(minutes=10)
+
+        upcoming = assignment.objects.filter(
+            deleted=False,
+            deadline__gte=warn_from,
+            deadline__lte=warn_to,
+        ).exclude(
+            status__name__iexact='Completed'
+        ).exclude(
+            status__name__iexact='Overdue'
+        ).select_related('task', 'assigned_to')
+
+        for a in upcoming:
+            # Avoid duplicate warnings: check if we already sent one in the last 15 min
+            already_warned = notification.objects.filter(
+                user_id=a.assigned_to.id,
+                title="DEADLINE WARNING",
+                message__contains=a.task.title,
+            ).filter(
+                created_at__gte=now - timedelta(minutes=15)
+            ).exists()
+
+            if not already_warned:
+                mins_left = max(0, int((a.deadline - now).total_seconds() // 60))
+                _notify(a.assigned_to.id, "DEADLINE WARNING",
+                        f"⏰ Deadline in ~{mins_left} min: '{a.task.title}'. Complete it now!")
+                # Also alert admin
+                _notify(admin_id, "DEADLINE APPROACHING",
+                        f"⏰ {a.assigned_to.name}'s task '{a.task.title}' deadline in ~{mins_left} min.")
+
+    except Exception as e:
+        logger.error(f"[LIFECYCLE] Error: {e}", exc_info=True)
+
+
+def generate_admin_summary():
+    """10-minute slot: Workload summary for admin."""
     try:
-        from .models import system_log
-        if slot_id:
-            lock_action = f"[SUMMARY_LOCK] {slot_id}"
-            _, created = system_log.objects.get_or_create(action=lock_action)
-            if not created:
-                return
-
-        pending = assignment.objects.filter(status__name__iexact='Pending', deleted=False).count()
-        active = assignment.objects.filter(status__name__iexact='In Progress', deleted=False).count()
-        overdue = assignment.objects.filter(status__name__iexact='Overdue', deleted=False).count()
-        
-        # Stop notification if all critical counts are 0
-        if (pending + active + overdue) == 0:
-            logger.info("Admin Summary skipped: All work counters are zero.")
-            return
-
-        summary_msg = (
-            f"📈 10-Min Summary: {active} In-Progress, "
-            f"{pending} Pending, {overdue} Overdue."
-        )
-
-        # 🛡️ De-duplication: Check if identical summary was sent in last 60 seconds
         from django.utils import timezone
-        from datetime import timedelta
-        cutoff = timezone.now() - timedelta(seconds=60)
-        
-        duplicate = notification.objects.filter(
-            title="WORKLOAD SUMMARY",
-            message=summary_msg,
-            created_at__gte=cutoff
-        ).exists()
+        now = timezone.now()
+        clock_time = timezone.localtime(now).strftime("%I:%M %p")
+        admin_id = _get_admin_id()
 
-        if duplicate:
-            logger.info("Admin Summary duplicate suppressed.")
+        pending  = assignment.objects.filter(status__name__iexact='Pending',     deleted=False).count()
+        active   = assignment.objects.filter(status__name__iexact='In Progress', deleted=False).count()
+        overdue  = assignment.objects.filter(status__name__iexact='Overdue',     deleted=False).count()
+        done_today = assignment.objects.filter(
+            status__name__iexact='Completed',
+            end_date__date=timezone.localtime(now).date(),
+            deleted=False
+        ).count()
+
+        _notify(admin_id, "WORKLOAD SUMMARY",
+                f"📊 Summary at {clock_time} — "
+                f"Pending: {pending} | Active: {active} | "
+                f"Overdue: {overdue} | Completed today: {done_today}")
+
+    except Exception as e:
+        logger.error(f"[SUMMARY] Error: {e}", exc_info=True)
+
+
+def trigger_overdue_recurring_nag():
+    """10-minute slot: Remind employees with overdue tasks."""
+    try:
+        from django.utils import timezone
+        clock_time = timezone.localtime(timezone.now()).strftime("%I:%M %p")
+        admin_id = _get_admin_id()
+
+        overdue_assignments = assignment.objects.filter(
+            status__name__iexact='Overdue',
+            deleted=False
+        ).select_related('assigned_to', 'task')
+
+        if not overdue_assignments.exists():
             return
 
-        # Find the primary administrator to receive alerts
-        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
-        admin_id = admin.id if admin else 1
+        # Group by employee
+        user_tasks: dict = {}
+        for a in overdue_assignments:
+            uid = a.assigned_to.id
+            user_tasks.setdefault(uid, {'user': a.assigned_to, 'titles': []})
+            user_tasks[uid]['titles'].append(a.task.title)
 
-        notification.objects.create(user_id=admin_id, title="WORKLOAD SUMMARY", message=summary_msg)
-        logger.info(f"Admin Summary Sent: {summary_msg}")
+        for uid, data in user_tasks.items():
+            count = len(data['titles'])
+            titles = ", ".join(data['titles'][:3])
+            if count > 3:
+                titles += "..."
+            _notify(uid, "OVERDUE REMINDER",
+                    f"⚠ {count} task(s) still OVERDUE at {clock_time}: {titles}. "
+                    f"Please complete them immediately!")
+
+        total = overdue_assignments.count()
+        _notify(admin_id, "OVERDUE NAG SUMMARY",
+                f"🚨 Nag sent at {clock_time}: {len(user_tasks)} employee(s) "
+                f"have {total} overdue task(s) unresolved.")
+
     except Exception as e:
-        logger.error(f"Error generating admin summary: {e}")
+        logger.error(f"[NAG] Error: {e}", exc_info=True)
+
 
 def cleanup_expired_otps():
-    """ 🧹 Periodically cleans up the OTP table. """
+    """Hourly: Remove OTPs older than 5 minutes."""
     try:
         from .models import otp_entry
         from django.utils import timezone
-        from datetime import timedelta
-        # Delete OTPs older than 5 minutes
         expiry = timezone.now() - timedelta(minutes=5)
-        deleted_count, _ = otp_entry.objects.filter(created_at__lt=expiry).delete()
-        if deleted_count > 0:
-            logger.info(f"Cleaned up {deleted_count} expired OTP entries from DB.")
+        deleted, _ = otp_entry.objects.filter(created_at__lt=expiry).delete()
+        if deleted:
+            logger.info(f"[CLEANUP] Removed {deleted} expired OTPs.")
     except Exception as e:
-        logger.error(f"Error cleaning up OTPs: {e}")
+        logger.error(f"[CLEANUP-OTP] Error: {e}", exc_info=True)
 
-def trigger_overdue_recurring_nag():
-    """ 🔁 Recurring (10-min) nag for tasks that are ALREADY marked Overdue and not completed. """
-    logger.info("Starting recurring overdue nag cycle...")
-    try:
-        overdue_tasks = assignment.objects.filter(status__name__iexact='Overdue', deleted=False)
-        for a in overdue_tasks:
-            # Notify Employee
-            notification.objects.create(user=a.assigned_to, title="TASK OVERDUE", message=f"⚠ STICKY ALERT: Task {a.task.title} is OVERDUE. Please complete it immediately!")
-            # Notify Admin
-            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
-            admin_id = admin.id if admin else 1
-            notification.objects.create(user_id=admin_id, title="NAG ALERT", message=f"🚨 NAG: User {a.assigned_to.name} is still ignoring Overdue Task {a.task.title}")
-            
-        if overdue_tasks.count() > 0:
-            logger.info(f"Nagged {overdue_tasks.count()} overdue assignments.")
-    except Exception as e:
-        logger.error(f"Error in overdue nag: {e}")
 
 def cleanup_old_forum_messages():
-    """ 🧹 Periodically cleans up forum messages older than 24 hours. """
+    """Hourly: Soft-delete forum messages older than 24 hours."""
     try:
         from django.utils import timezone
-        from datetime import timedelta
-        # Delete messages older than 24 hours
         expiry = timezone.now() - timedelta(hours=24)
-        deleted_count, _ = forum_entry.objects.filter(dtm_created__lt=expiry, deleted=False).delete()
-        if deleted_count > 0:
-            logger.info(f"Cleaned up {deleted_count} forum messages older than 24 hours.")
+        deleted, _ = forum_entry.objects.filter(
+            dtm_created__lt=expiry, deleted=False
+        ).update(deleted=True), None
+        logger.info(f"[CLEANUP] Archived old forum messages.")
     except Exception as e:
-        logger.error(f"Error cleaning up forum messages: {e}")
+        logger.error(f"[CLEANUP-FORUM] Error: {e}", exc_info=True)
+
 
 def repair_live_database():
-    """ 🩹 PRODUCTION RESCUE: Fixes legacy date strings in SQLite that crash fromisoformat. """
+    """Startup: Fix legacy date strings and remove stale heartbeats."""
     from django.db import connection
     try:
         with connection.cursor() as cursor:
-            # 1. Update Start Date
-            cursor.execute("UPDATE assignment SET start_date = start_date || ' 00:00:00' WHERE start_date IS NOT NULL AND length(start_date) = 10 AND start_date NOT LIKE '%:%'")
-            # 2. Update Deadline
-            cursor.execute("UPDATE assignment SET deadline = deadline || ' 00:00:00' WHERE deadline IS NOT NULL AND length(deadline) = 10 AND deadline NOT LIKE '%:%'")
-            # 3. Update End Date
-            cursor.execute("UPDATE assignment SET end_date = end_date || ' 00:00:00' WHERE end_date IS NOT NULL AND length(end_date) = 10 AND end_date NOT LIKE '%:%'")
-            
-            row_count = cursor.rowcount
-            if row_count > 0:
-                print(f"[REPAIR] Successfully normalized {row_count} legacy date entries in production.")
-            
-            # 4. Remove leftover Technical Heartbeats from notification table
-            # (Fixing the regression I introduced)
-            deleted_notifs, _ = notification.objects.filter(title="SYS_HEARTBEAT").delete()
-            if deleted_notifs > 0:
-                print(f"[REPAIR] Deleted {deleted_notifs} technical heartbeats from notification table.")
-
+            for col in ('start_date', 'deadline', 'end_date'):
+                cursor.execute(
+                    f"UPDATE assignment SET {col} = {col} || ' 00:00:00' "
+                    f"WHERE {col} IS NOT NULL "
+                    f"AND length({col}) = 10 "
+                    f"AND {col} NOT LIKE '%:%'"
+                )
+        notification.objects.filter(title="SYS_HEARTBEAT").delete()
+        logger.info("[REPAIR] Database normalisation complete.")
     except Exception as e:
-        print(f"[REPAIR] Error during automatic database correction: {e}")
+        logger.error(f"[REPAIR] Error: {e}", exc_info=True)

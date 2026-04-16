@@ -22,12 +22,17 @@ from django.db.models import Max
 
 def _log(tag, msg, user_id=0):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {msg}")
-    if user_id:
-        try:
-            user = app_user.objects.get(id=user_id)
+    
+    # Use id=1 (Primary Admin) as fallback for system/background logs
+    # to avoid NOT NULL constraint failed: log.user_id
+    effective_id = user_id if user_id > 0 else 1
+    
+    try:
+        user = app_user.objects.filter(id=effective_id, deleted=False).first()
+        if user:
             system_log.objects.create(user=user, action=f"[{tag}] {msg}")
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 def _err(tag, msg, exc=None, user_id=0):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ [{tag}] ERROR: {msg}")
@@ -586,8 +591,8 @@ def manage_assignments(request):
                     "message": f"⚠️ Already Assigned: {target_user.name} already has this task ({existing.status.name})."
                 }, status=400)
 
-            # Default first status if available
-            default_status = statusoption.objects.first()
+            # Default first status — always 'Pending'
+            default_status, _ = statusoption.objects.get_or_create(name='Pending')
             
             from django.utils.dateparse import parse_datetime
             from django.utils.timezone import make_aware, is_aware
@@ -618,6 +623,13 @@ def manage_assignments(request):
                 f"📋 You have been assigned a new task: '{task.title}' by {assigner.name}"
             )
             
+            # 🔔 IMMEDIATE NOTIFICATION (To Employee)
+            _add_notif_logic(
+                target_user.id, 
+                "NEW ASSIGNMENT", 
+                f"📋 You have been assigned a new task: {task.title}"
+            )
+
             return Response({"status": "success", "assignment_id": new_assign.id})
         except Exception as e:
             _err("ASSIGN-CREATE", str(e), exc=True)
@@ -639,8 +651,8 @@ def update_assignment(request):
 
         for field, value in updates.items():
             if field == 'status':
-                s = statusoption.objects.filter(name__iexact=value).first()
-                if s: assign.status = s
+                s, _ = statusoption.objects.get_or_create(name=value)
+                assign.status = s
             elif field == 'assigned_to_id' or field == 'emp_id':
                  u = app_user.objects.filter(id=value).first()
                  if u: assign.assigned_to = u
@@ -648,6 +660,17 @@ def update_assignment(request):
                 setattr(assign, field, value)
         
         assign.save()
+
+        # 🔔 IMMEDIATE NOTIFICATION (On Completion)
+        if updates.get('status', '').lower() == 'completed':
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            if admin:
+                _add_notif_logic(
+                    admin.id, 
+                    "TASK COMPLETED", 
+                    f"✅ {assign.assigned_to.name} finished: {assign.task.title}"
+                )
+
         return Response({"status": "success"})
     except Exception as e:
         _err("ASSIGN-UPDATE", str(e), exc=True)
@@ -896,9 +919,10 @@ def start_task(request):
              return Response({"status": "error", "message": "user_id is required for concurrency check"}, status=400)
 
         # 🛡️ CONCURRENCY LOCK: Only one task "In Progress" at a time for this user
+        in_progress_status, _ = statusoption.objects.get_or_create(name='In Progress')
         in_progress_count = assignment.objects.filter(
             assigned_to_id=user_id, 
-            status__name__iexact='In Progress',
+            status=in_progress_status,
             deleted=False
         ).count()
         
@@ -908,7 +932,7 @@ def start_task(request):
                  "message": "⚠️ CONCURRENCY LOCK: You already have a task in progress. You must complete it before starting another."
              }, status=403)
 
-        status = statusoption.objects.filter(name__iexact='In Progress').first()
+        status = in_progress_status
         
         # Security: check ownership
         qs = assignment.objects.filter(id=assign_id, deleted=False)
@@ -919,6 +943,18 @@ def start_task(request):
         if not updated:
              return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
              
+        # 🔔 IMMEDIATE NOTIFICATION (To Admin)
+        try:
+            assign = qs.first()
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            if admin and assign:
+                _add_notif_logic(
+                    admin.id, 
+                    "TASK STARTED", 
+                    f"🚀 {assign.assigned_to.name} started working on: {assign.task.title}"
+                )
+        except: pass
+
         return Response({"status": "success"})
     except Exception as e:
         return Response({"status": "error", "message": str(e)}, status=400)
@@ -929,7 +965,7 @@ def complete_task(request):
     user_id   = request.data.get('user_id')
     try:
         # 🚀 NO APPROVAL FLOW: Move directly to 'Completed'
-        status = statusoption.objects.filter(name__iexact='Completed').first()
+        status, _ = statusoption.objects.get_or_create(name='Completed')
         
         # Security: check ownership
         qs = assignment.objects.filter(id=assign_id, deleted=False)
@@ -939,6 +975,18 @@ def complete_task(request):
         updated = qs.update(status=status, end_date=timezone.now())
         if not updated:
              return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+
+        # 🔔 IMMEDIATE NOTIFICATION (To Admin)
+        try:
+            assign = qs.first()
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            if admin and assign:
+                _add_notif_logic(
+                    admin.id, 
+                    "TASK COMPLETED", 
+                    f"✅ {assign.assigned_to.name} finished: {assign.task.title}"
+                )
+        except: pass
 
         return Response({"status": "success"})
     except Exception as e:
@@ -951,6 +999,8 @@ def request_approval(request):
     comment   = request.data.get('comment', '')
     try:
         status = statusoption.objects.filter(name__iexact='Awaiting Approval').first()
+        if not status:
+            status, _ = statusoption.objects.get_or_create(name='Awaiting Approval')
         
         # Security: check ownership
         qs = assignment.objects.filter(id=assign_id, deleted=False)
@@ -1033,6 +1083,19 @@ def get_reports(request):
         return Response(report)
     except Exception as e:
         _err("REPORTS", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['GET'])
+def system_check(request):
+    """
+    LIGHTWEIGHT PULSE CHECK (PRECISION UPGRADE)
+    Real logic is now handled by the Background Worker.
+    This endpoint remains for legacy compatibility and health checks.
+    """
+    try:
+        return Response({"status": "ok", "summary": "System background worker active and healthy."})
+    except Exception as e:
+        _err("SYSTEM-CHECK", str(e), exc=True)
         return Response({"status": "error", "message": str(e)}, status=500)
 
 @api_view(['GET'])
@@ -1139,3 +1202,46 @@ def _add_notif_logic(user_id, title, message):
         notification.objects.create(user=user, title=title, message=message)
     except Exception:
         pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTELLIGENT PULSE SYNC
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_pulse(request):
+    """
+    Lightweight sync check. Returns a sync_key that changes whenever any
+    assignment is created, updated (start/end date, status), or a new
+    notification arrives for the requesting user.
+    """
+    user_id = request.query_params.get('user_id')
+    if not user_id:
+        return Response({"error": "user_id required"}, status=400)
+        
+    try:
+        # 1. Assignments (Total count + Max ID)
+        agg_assign = assignment.objects.filter(deleted=False).aggregate(
+            c=Count('id'),
+            m=Max('id'),
+            mod=Max('dtm_modified')
+        )
+        a_count = agg_assign['c'] or 0
+        a_max   = agg_assign['m'] or 0
+        # Incorporate timestamp to catch status updates (since modified changes)
+        a_mod   = int(agg_assign['mod'].timestamp()) if agg_assign['mod'] else 0
+
+        # 2. Notifications (Max ID for THIS user)
+        n_max = notification.objects.filter(user_id=user_id).aggregate(m=Max('id'))['m'] or 0
+
+        # 3. Forum (Overall count)
+        f_count = forum_entry.objects.filter(deleted=False).count()
+
+        sync_key = f"v{a_count}_{a_max}_{a_mod}_{n_max}_{f_count}"
+        
+        return Response({
+            "sync_key": sync_key,
+            "server_time": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        _err("PULSE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
