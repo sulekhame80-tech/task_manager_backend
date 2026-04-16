@@ -294,9 +294,7 @@ def create_employee(request):
     
     permitted, req_user = _check_permission(req_user_id)
     if not permitted:
-        return Response({"status": "error", "message": "Permission denied"}, status=403)
-
-    _log("EMP-CREATE", f"name={data.get('name')} email={data.get('email')} by={req_user.name}")
+        return Response({"status": "error", "message": "Permission denied. Only Admins and Managers can create users. Please re-login if this is unexpected."}, status=403)
     
     try:
         if app_user.objects.filter(email=data.get('email'), deleted=False).exists():
@@ -313,10 +311,10 @@ def create_employee(request):
         
         # Manager Protection: Cannot create an admin
         if req_user.role == 'manager' and role == 'admin':
-             return Response({"status": "error", "message": "Managers cannot create Admin accounts"}, status=403)
+             return Response({"status": "error", "message": "Managers are not permitted to create Admin accounts. Contact your system administrator."}, status=403)
              
         if role not in ['admin', 'manager', 'employee']:
-            return Response({"status": "error", "message": "Invalid role selected"}, status=400)
+            return Response({"status": "error", "message": f"Invalid role '{role}'. Must be admin, manager, or employee."}, status=400)
 
         user = app_user.objects.create(
             name=data.get('name'),
