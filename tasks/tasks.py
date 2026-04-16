@@ -154,5 +154,11 @@ def repair_live_database():
             if row_count > 0:
                 print(f"[REPAIR] Successfully normalized {row_count} legacy date entries in production.")
             
+            # 4. Remove leftover Technical Heartbeats from notification table
+            # (Fixing the regression I introduced)
+            deleted_notifs, _ = notification.objects.filter(title="SYS_HEARTBEAT").delete()
+            if deleted_notifs > 0:
+                print(f"[REPAIR] Deleted {deleted_notifs} technical heartbeats from notification table.")
+
     except Exception as e:
         print(f"[REPAIR] Error during automatic database correction: {e}")

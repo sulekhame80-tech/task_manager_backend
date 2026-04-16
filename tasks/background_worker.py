@@ -30,17 +30,17 @@ def automation_loop():
                 continue
 
             # 🛠️ 2. Singleton Guard (Leader Election)
-            # We use a hidden HEARTBEAT notification to ensure only one worker runs.
-            from .models import notification, app_user
+            # We use a hidden HEARTBEAT in system_log (NOT notifications) to ensure only one worker runs.
+            from .models import app_user, system_log
             
             # Check if anyone already took this minute slot
             from django.utils import timezone
             from datetime import timedelta
             cutoff = timezone.now() - timedelta(seconds=55)
             
-            already_run = notification.objects.filter(
-                title="SYS_HEARTBEAT", 
-                created_at__gte=cutoff
+            already_run = system_log.objects.filter(
+                action__startswith="[SYS_HEARTBEAT]", 
+                timestamp__gte=cutoff
             ).exists()
 
             if already_run:
@@ -52,9 +52,9 @@ def automation_loop():
             try:
                 admin = app_user.objects.filter(role__iexact='admin').first()
                 admin_id = admin.id if admin else 1
-                notification.objects.create(user_id=admin_id, title="SYS_HEARTBEAT", message=f"Worker {current_min} active")
+                # Save to system_log ONLY (Audit trail, no popups)
+                system_log.objects.create(user_id=admin_id, action=f"[SYS_HEARTBEAT] Worker {current_min} active")
             except Exception:
-                # Failure to create heartbeat likely means someone beat us or DB is locked
                 last_run_min = current_min
                 continue
 
