@@ -14,57 +14,76 @@ def automation_loop():
     """ The heartbeat of the 'Always Active' Backend Engine. """
     logger.info("[ENGINE] Starting Background Automation Loop...")
     
-    # 🚀 1. Startup Delay: Give the system time to finalize migrations and settlements
-    logger.info("[ENGINE] Entering 10s startup cooldown...")
+    # 🚀 1. Startup Delay
     time.sleep(10)
     
-    last_summary = datetime.now() - timedelta(seconds=30) 
-    last_nag = datetime.now()
-    last_overdue = datetime.now()
-    last_1m_maint = datetime.now()
+    last_run_min = -1
 
     while True:
         try:
             now = datetime.now()
+            current_min = now.minute
 
-            # 🔄 1. Immediate Monitoring (Tasks and Status Lifecycle)
-            # Detects "Task Started" etc. immediately (~45s)
+            # 🛠️ 1. Once-per-minute execution check
+            if current_min == last_run_min:
+                time.sleep(5)
+                continue
+
+            # 🛠️ 2. Singleton Guard (Leader Election)
+            # We use a hidden HEARTBEAT notification to ensure only one worker runs.
+            from .models import notification, app_user
+            
+            # Check if anyone already took this minute slot
+            from django.utils import timezone
+            from datetime import timedelta
+            cutoff = timezone.now() - timedelta(seconds=55)
+            
+            already_run = notification.objects.filter(
+                title="SYS_HEARTBEAT", 
+                created_at__gte=cutoff
+            ).exists()
+
+            if already_run:
+                # Another worker is already handling this minute slot
+                last_run_min = current_min
+                continue
+
+            # Attempt to claim the slot
             try:
-                monitor_assignments_lifecycle()
-            except Exception as e:
-                # If tables don't exist yet, we just wait
-                if "no such table" in str(e).lower():
-                    logger.warning("[ENGINE] Database tables not ready yet. Retrying in 10s...")
-                    time.sleep(10)
-                    continue
-                raise e
+                admin = app_user.objects.filter(role__iexact='admin').first()
+                admin_id = admin.id if admin else 1
+                notification.objects.create(user_id=admin_id, title="SYS_HEARTBEAT", message=f"Worker {current_min} active")
+            except Exception:
+                # Failure to create heartbeat likely means someone beat us or DB is locked
+                last_run_min = current_min
+                continue
 
-            # 📊 2. 10-Minute Admin Summary
-            if now >= last_summary + timedelta(minutes=10):
-                logger.info("[ENGINE] Generating 10-minute Admin Summary...")
+            logger.info(f"[ENGINE] Leading minute slot: {current_min}")
+
+            # 📊 3. Exclusive Slots
+            # Multiples of 10 (:00, :10, :20...) -> SUMMARY + NAG
+            if current_min % 10 == 0:
+                logger.info(f"[ENGINE] Slot {current_min}: Generating Summary & Nag...")
                 generate_admin_summary()
-                last_summary = now
+                trigger_overdue_recurring_nag()
+            
+            # Multiples of 5 (BUT NOT 10) (:05, :15, :25...) -> PRIMARY OVERDUE
+            elif current_min % 5 == 0:
+                logger.info(f"[ENGINE] Slot {current_min}: Running Primary Overdue Check...")
+                monitor_assignments_lifecycle()
 
-            # 🚨 3. 5-Minute Overdue Primary Check
-            if now >= last_overdue + timedelta(minutes=5):
-                logger.info("[ENGINE] Running 5-minute Primary Overdue Check...")
-                monitor_assignments_lifecycle() # Re-confirming state
-                trigger_overdue_recurring_nag() # <--- Also run nag here
-                last_overdue = now
-                last_nag = now # Synced
-
-            # 🧹 4. One-Minute System Maintenance (OTP Cleanup)
-            if now >= last_1m_maint + timedelta(minutes=1):
-                logger.info("[ENGINE] Running 1-minute System Maintenance...")
+            # 🧹 4. System Maintenance (Every hour at :01)
+            if current_min == 1:
+                logger.info("[ENGINE] Running hourly system maintenance...")
                 cleanup_expired_otps()
-                cleanup_old_forum_messages() # Check for old chat messages
-                last_1m_maint = now
+                cleanup_old_forum_messages()
+
+            last_run_min = current_min
 
         except Exception as e:
-            logger.error(f"[ENGINE] Error in automation loop: {e}", exc_info=True)
+            logger.error(f"[ENGINE] Loop Error: {e}", exc_info=True)
 
-        # 🐢 Throttled Sleep (Increased precision for 30s checks)
-        time.sleep(2)
+        time.sleep(5)
 
 def start_automation_engine():
     """ Main entry point to start the daemon thread. """
