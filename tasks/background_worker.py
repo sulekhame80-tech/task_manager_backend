@@ -14,6 +14,10 @@ def automation_loop():
     """ The heartbeat of the 'Always Active' Backend Engine. """
     logger.info("[ENGINE] Starting Background Automation Loop...")
     
+    # 🚀 1. Startup Delay: Give the system time to finalize migrations and settlements
+    logger.info("[ENGINE] Entering 10s startup cooldown...")
+    time.sleep(10)
+    
     last_summary = datetime.now() - timedelta(seconds=30) 
     last_nag = datetime.now()
     last_overdue = datetime.now()
@@ -25,7 +29,15 @@ def automation_loop():
 
             # 🔄 1. Immediate Monitoring (Tasks and Status Lifecycle)
             # Detects "Task Started" etc. immediately (~45s)
-            monitor_assignments_lifecycle()
+            try:
+                monitor_assignments_lifecycle()
+            except Exception as e:
+                # If tables don't exist yet, we just wait
+                if "no such table" in str(e).lower():
+                    logger.warning("[ENGINE] Database tables not ready yet. Retrying in 10s...")
+                    time.sleep(10)
+                    continue
+                raise e
 
             # 📊 2. 10-Minute Admin Summary
             if now >= last_summary + timedelta(minutes=10):
