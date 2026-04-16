@@ -137,3 +137,22 @@ def cleanup_old_forum_messages():
             logger.info(f"Cleaned up {deleted_count} forum messages older than 24 hours.")
     except Exception as e:
         logger.error(f"Error cleaning up forum messages: {e}")
+
+def repair_live_database():
+    """ 🩹 PRODUCTION RESCUE: Fixes legacy date strings in SQLite that crash fromisoformat. """
+    from django.db import connection
+    try:
+        with connection.cursor() as cursor:
+            # 1. Update Start Date
+            cursor.execute("UPDATE assignment SET start_date = start_date || ' 00:00:00' WHERE start_date IS NOT NULL AND length(start_date) = 10 AND start_date NOT LIKE '%:%'")
+            # 2. Update Deadline
+            cursor.execute("UPDATE assignment SET deadline = deadline || ' 00:00:00' WHERE deadline IS NOT NULL AND length(deadline) = 10 AND deadline NOT LIKE '%:%'")
+            # 3. Update End Date
+            cursor.execute("UPDATE assignment SET end_date = end_date || ' 00:00:00' WHERE end_date IS NOT NULL AND length(end_date) = 10 AND end_date NOT LIKE '%:%'")
+            
+            row_count = cursor.rowcount
+            if row_count > 0:
+                print(f"[REPAIR] Successfully normalized {row_count} legacy date entries in production.")
+            
+    except Exception as e:
+        print(f"[REPAIR] Error during automatic database correction: {e}")

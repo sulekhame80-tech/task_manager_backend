@@ -17,5 +17,8 @@ class TasksConfig(AppConfig):
             return
 
         # 🚀 Start the background automation engine (Django DB based)
+        from .tasks import repair_live_database
+        repair_live_database()
+        
         from .background_worker import start_automation_engine
         start_automation_engine()
