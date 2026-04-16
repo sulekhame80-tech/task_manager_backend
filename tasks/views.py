@@ -273,6 +273,11 @@ def create_employee(request):
         if app_user.objects.filter(email=data.get('email'), deleted=False).exists():
             return Response({"status": "error", "message": "Email already exists"}, status=400)
         
+        phone = data.get('phone')
+        if phone and str(phone).strip() != "":
+            if app_user.objects.filter(phone=phone, deleted=False).exists():
+                return Response({"status": "error", "message": "Phone number already is in use by another user"}, status=400)
+        
         role = str(data.get('role', 'employee')).lower()
         
         # Manager Protection: Cannot create an admin
