@@ -15,28 +15,36 @@ def monitor_assignments_lifecycle():
     try:
         # 1. NOT STARTED Alert
         unstarted = assignment.objects.filter(
-            status__name='Pending', 
+            status__name__iexact='Pending', 
             start_date__isnull=True, 
             notified_start=False,
             deleted=False
-        )
+        ).select_related('task', 'assigned_to')
         for a in unstarted:
-            notification.objects.create(user_id=1, title="TASK ALERT", message=f"⚠ Emp {a.assigned_to.id} has NOT STARTED Task {a.task.title}")
+            # Find the primary administrator to receive alerts
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            admin_id = admin.id if admin else 1
+            notification.objects.create(user_id=admin_id, title="TASK ALERT", message=f"⚠ Emp {a.assigned_to.id} has NOT STARTED Task {a.task.title}")
             a.notified_start = True
             a.save()
             logger.info(f"Alerted: Not Started for Assign ID {a.id}")
 
         # 2. OVERDUE Alert
-        today = datetime.now().date()
+        from django.utils import timezone
+        now = timezone.now()
         status_overdue, _ = statusoption.objects.get_or_create(name='Overdue')
         overdue_qs = assignment.objects.filter(
             deleted=False,
-            deadline__lt=today,
+            deadline__lt=now,
             notified_overdue=False
-        ).exclude(status__name='Completed')
+        ).exclude(status__name__iexact='Completed')
+
+        # Find the primary administrator to receive alerts
+        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+        admin_id = admin.id if admin else 1
 
         for a in overdue_qs:
-            notification.objects.create(user_id=1, title="OVERDUE ALERT", message=f"🚨 OVERDUE: Task {a.task.title} delayed by User {a.assigned_to.name}")
+            notification.objects.create(user_id=admin_id, title="OVERDUE ALERT", message=f"🚨 OVERDUE: Task {a.task.title} delayed by User {a.assigned_to.name}")
             a.status = status_overdue
             a.notified_overdue = True
             a.save()
@@ -47,9 +55,9 @@ def monitor_assignments_lifecycle():
 def generate_admin_summary():
     """ 📊 Generates a 10-minute summary of all active workloads. """
     try:
-        pending = assignment.objects.filter(status__name='Pending', deleted=False).count()
-        active = assignment.objects.filter(status__name='In Progress', deleted=False).count()
-        overdue = assignment.objects.filter(status__name='Overdue', deleted=False).count()
+        pending = assignment.objects.filter(status__name__iexact='Pending', deleted=False).count()
+        active = assignment.objects.filter(status__name__iexact='In Progress', deleted=False).count()
+        overdue = assignment.objects.filter(status__name__iexact='Overdue', deleted=False).count()
         
         # Stop notification if all critical counts are 0
         if (pending + active + overdue) == 0:
@@ -76,7 +84,11 @@ def generate_admin_summary():
             logger.info("Admin Summary duplicate suppressed.")
             return
 
-        notification.objects.create(user_id=1, title="WORKLOAD SUMMARY", message=summary_msg)
+        # Find the primary administrator to receive alerts
+        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+        admin_id = admin.id if admin else 1
+
+        notification.objects.create(user_id=admin_id, title="WORKLOAD SUMMARY", message=summary_msg)
         logger.info(f"Admin Summary Sent: {summary_msg}")
     except Exception as e:
         logger.error(f"Error generating admin summary: {e}")
@@ -99,12 +111,14 @@ def trigger_overdue_recurring_nag():
     """ 🔁 Recurring (10-min) nag for tasks that are ALREADY marked Overdue and not completed. """
     logger.info("Starting recurring overdue nag cycle...")
     try:
-        overdue_tasks = assignment.objects.filter(status__name='Overdue', deleted=False)
+        overdue_tasks = assignment.objects.filter(status__name__iexact='Overdue', deleted=False)
         for a in overdue_tasks:
             # Notify Employee
             notification.objects.create(user=a.assigned_to, title="TASK OVERDUE", message=f"⚠ STICKY ALERT: Task {a.task.title} is OVERDUE. Please complete it immediately!")
             # Notify Admin
-            notification.objects.create(user_id=1, title="NAG ALERT", message=f"🚨 NAG: User {a.assigned_to.name} is still ignoring Overdue Task {a.task.title}")
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            admin_id = admin.id if admin else 1
+            notification.objects.create(user_id=admin_id, title="NAG ALERT", message=f"🚨 NAG: User {a.assigned_to.name} is still ignoring Overdue Task {a.task.title}")
             
         if overdue_tasks.count() > 0:
             logger.info(f"Nagged {overdue_tasks.count()} overdue assignments.")

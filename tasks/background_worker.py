@@ -49,15 +49,11 @@ def automation_loop():
             if now >= last_overdue + timedelta(minutes=5):
                 logger.info("[ENGINE] Running 5-minute Primary Overdue Check...")
                 monitor_assignments_lifecycle() # Re-confirming state
+                trigger_overdue_recurring_nag() # <--- Also run nag here
                 last_overdue = now
+                last_nag = now # Synced
 
-            # 🔁 4. 10-Minute Recurring Overdue Nag
-            if now >= last_nag + timedelta(minutes=10):
-                logger.info("[ENGINE] Tracing 10-minute Recurring Overdue Nag...")
-                trigger_overdue_recurring_nag()
-                last_nag = now
-
-            # 🧹 5. One-Minute System Maintenance (OTP Cleanup)
+            # 🧹 4. One-Minute System Maintenance (OTP Cleanup)
             if now >= last_1m_maint + timedelta(minutes=1):
                 logger.info("[ENGINE] Running 1-minute System Maintenance...")
                 cleanup_expired_otps()

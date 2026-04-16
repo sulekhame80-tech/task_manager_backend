@@ -76,9 +76,9 @@ class assignment(models.Model):
     task = models.ForeignKey(task_management, on_delete=models.CASCADE, db_index=True)
     assigned_to = models.ForeignKey(app_user, on_delete=models.CASCADE, db_index=True)
 
-    start_date = models.DateField(null=True, blank=True)
-    deadline = models.DateField(null=True, blank=True, db_index=True)
-    end_date = models.DateField(null=True, blank=True)
+    start_date = models.DateTimeField(null=True, blank=True)
+    deadline = models.DateTimeField(null=True, blank=True, db_index=True)
+    end_date = models.DateTimeField(null=True, blank=True)
 
     status = models.ForeignKey(statusoption, on_delete=models.SET_NULL, null=True, blank=True)
 

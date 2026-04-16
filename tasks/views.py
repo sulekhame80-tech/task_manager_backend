@@ -55,6 +55,23 @@ def paginate_and_search(queryset, page=1, page_size=10, search=None, search_fiel
         "data": page_obj.object_list
     }
 
+def _add_notif_logic(user_id, title, message):
+    """ Robust Helper for System Notifications """
+    try:
+        target = app_user.objects.filter(id=user_id, deleted=False).first()
+        if not target:
+            return False
+        notification.objects.create(
+            user=target,
+            title=title,
+            message=message
+        )
+        _log("NOTIF-SYNC", f"Sent: '{title}' to {target.name}")
+        return True
+    except Exception as e:
+        _err("NOTIF-SYNC", f"Failed: {str(e)}")
+        return False
+
 def _check_permission(req_user_id, target_user_id=None, action="edit"):
     """
     Unified Permission Helper.
@@ -73,11 +90,18 @@ def _check_permission(req_user_id, target_user_id=None, action="edit"):
         req_user = app_user.objects.get(id=req_user_id, deleted=False)
         req_role = str(req_user.role).lower()
         
+        # 🛡️ GLOBAL ADMIN PROTECTION: Admin accounts cannot be edited or deleted by anyone
+        if target_user_id and action in ['edit', 'delete']:
+            target_user = app_user.objects.filter(id=target_user_id).first()
+            if target_user and str(target_user.role).lower() == 'admin':
+                _log("AUTH-PERM", f"Blocked {action} attempt on ADMIN id={target_user_id} by {req_user.name}")
+                return False, req_user
+
         if req_role == 'admin':
             return True, req_user
             
         if req_role == 'manager':
-            # Managers cannot touch Admins
+            # Managers cannot touch Admins (Redundant due to global protection, but good for hierarchy)
             if target_user_id:
                 target_user = app_user.objects.filter(id=target_user_id).first()
                 if target_user and str(target_user.role).lower() == 'admin':
@@ -277,7 +301,9 @@ def create_employee(request):
         if phone and str(phone).strip() != "":
             if app_user.objects.filter(phone=phone, deleted=False).exists():
                 return Response({"status": "error", "message": "Phone number already is in use by another user"}, status=400)
-        
+        else:
+            phone = None # Ensure NULL for database uniqueness
+
         role = str(data.get('role', 'employee')).lower()
         
         # Manager Protection: Cannot create an admin
@@ -286,10 +312,6 @@ def create_employee(request):
              
         if role not in ['admin', 'manager', 'employee']:
             return Response({"status": "error", "message": "Invalid role selected"}, status=400)
-
-        phone = data.get('phone')
-        if not phone or str(phone).strip() == "":
-            phone = None
 
         user = app_user.objects.create(
             name=data.get('name'),
@@ -496,12 +518,14 @@ def manage_assignments(request):
     """
     if request.method == 'GET':
         try:
+            # 🕒 TRIGGER OVERDUE CHECK (NOW HANDLED BY BACKGROUND WORKER)
+
             emp_id = request.query_params.get('emp_id')
             search = request.query_params.get('search')
             page   = int(request.query_params.get('page', 1))
             size   = int(request.query_params.get('page_size', 10))
             
-            qs = assignment.objects.filter(deleted=False)
+            qs = assignment.objects.filter(deleted=False).select_related('task', 'assigned_to', 'status', 'task__priority')
             if emp_id:
                 qs = qs.filter(assigned_to_id=emp_id)
             
@@ -518,22 +542,82 @@ def manage_assignments(request):
         data = request.data
         task_id = data.get('task_id')
         emp_id  = data.get('emp_id')
-        _log("ASSIGN-CREATE", f"task={task_id} to={emp_id}")
+        req_user_id = data.get('req_user_id') or data.get('admin_id')
+        
+        _log("ASSIGN-CREATE", f"task={task_id} to={emp_id} by={req_user_id}")
         
         try:
             task = task_management.objects.get(id=task_id)
-            user = app_user.objects.get(id=emp_id)
+            target_user = app_user.objects.get(id=emp_id)
+            assigner = app_user.objects.filter(id=req_user_id).first()
             
+            if not assigner:
+                return Response({"status": "error", "message": f"Authorization Error: User ID '{req_user_id}' not found. Please re-login."}, status=400)
+            
+            assigner_role = str(assigner.role).lower()
+            target_role = str(target_user.role).lower()
+            
+            # --- ROLE HIERARCHY VALIDATION ---
+            # 1. Self-assignment check
+            if str(assigner.id) == str(target_user.id):
+                 return Response({"status": "error", "message": "You cannot assign tasks to yourself"}, status=403)
+            
+            # 2. Hierarchy enforcement
+            if assigner_role == 'manager':
+                if target_role != 'employee':
+                    return Response({"status": "error", "message": "Managers can only assign tasks to Employees"}, status=403)
+            elif assigner_role == 'admin':
+                if target_role == 'admin':
+                    return Response({"status": "error", "message": "Admins cannot assign tasks to other Admins"}, status=403)
+            else:
+                return Response({"status": "error", "message": "Employees cannot assign tasks"}, status=403)
+            
+            # --- DUPLICATE ASSIGNMENT CHECK ---
+            # Prevent assigning the same template to the same person if they already have an active/pending version
+            existing = assignment.objects.filter(
+                task_id=task_id, 
+                assigned_to_id=emp_id, 
+                deleted=False
+            ).exclude(status__name__iexact='Completed').first()
+            
+            if existing:
+                return Response({
+                    "status": "error", 
+                    "message": f"⚠️ Already Assigned: {target_user.name} already has this task ({existing.status.name})."
+                }, status=400)
+
             # Default first status if available
             default_status = statusoption.objects.first()
             
+            from django.utils.dateparse import parse_datetime
+            from django.utils.timezone import make_aware, is_aware
+            
+            raw_deadline = data.get('deadline')
+            deadline_dt = None
+            if raw_deadline:
+                # If it's just a date 'YYYY-MM-DD', append time
+                if len(raw_deadline) == 10:
+                    raw_deadline += " 23:59:59"
+                
+                deadline_dt = parse_datetime(raw_deadline)
+                if deadline_dt and not is_aware(deadline_dt):
+                    deadline_dt = make_aware(deadline_dt)
+
             new_assign = assignment.objects.create(
                 task=task,
-                assigned_to=user,
-                deadline=data.get('deadline'),
-                assigned_by=data.get('assigned_by', 'Admin'),
+                assigned_to=target_user,
+                deadline=deadline_dt,
+                assigned_by=assigner.name,
                 status=default_status
             )
+            
+            # 🔔 Trigger Notification for the assigned employee
+            _add_notif_logic(
+                target_user.id, 
+                "NEW TASK ASSIGNED", 
+                f"📋 You have been assigned a new task: '{task.title}' by {assigner.name}"
+            )
+            
             return Response({"status": "success", "assignment_id": new_assign.id})
         except Exception as e:
             _err("ASSIGN-CREATE", str(e), exc=True)
@@ -806,9 +890,35 @@ def delete_forum_entry(request):
 @api_view(['POST'])
 def start_task(request):
     assign_id = request.data.get('assign_id')
+    user_id   = request.data.get('user_id') # Required for security & concurrency
     try:
+        if not user_id:
+             return Response({"status": "error", "message": "user_id is required for concurrency check"}, status=400)
+
+        # 🛡️ CONCURRENCY LOCK: Only one task "In Progress" at a time for this user
+        in_progress_count = assignment.objects.filter(
+            assigned_to_id=user_id, 
+            status__name__iexact='In Progress',
+            deleted=False
+        ).count()
+        
+        if in_progress_count > 0:
+             return Response({
+                 "status": "locked", 
+                 "message": "⚠️ CONCURRENCY LOCK: You already have a task in progress. You must complete it before starting another."
+             }, status=403)
+
         status = statusoption.objects.filter(name__iexact='In Progress').first()
-        assignment.objects.filter(id=assign_id).update(status=status, start_date=timezone.now().date())
+        
+        # Security: check ownership
+        qs = assignment.objects.filter(id=assign_id, deleted=False)
+        if user_id:
+             qs = qs.filter(assigned_to_id=user_id)
+        
+        updated = qs.update(status=status, start_date=timezone.now())
+        if not updated:
+             return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+             
         return Response({"status": "success"})
     except Exception as e:
         return Response({"status": "error", "message": str(e)}, status=400)
@@ -816,9 +926,20 @@ def start_task(request):
 @api_view(['POST'])
 def complete_task(request):
     assign_id = request.data.get('assign_id')
+    user_id   = request.data.get('user_id')
     try:
+        # 🚀 NO APPROVAL FLOW: Move directly to 'Completed'
         status = statusoption.objects.filter(name__iexact='Completed').first()
-        assignment.objects.filter(id=assign_id).update(status=status, end_date=timezone.now().date())
+        
+        # Security: check ownership
+        qs = assignment.objects.filter(id=assign_id, deleted=False)
+        if user_id:
+             qs = qs.filter(assigned_to_id=user_id)
+
+        updated = qs.update(status=status, end_date=timezone.now())
+        if not updated:
+             return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+
         return Response({"status": "success"})
     except Exception as e:
         return Response({"status": "error", "message": str(e)}, status=400)
@@ -826,36 +947,59 @@ def complete_task(request):
 @api_view(['POST'])
 def request_approval(request):
     assign_id = request.data.get('assign_id')
+    user_id   = request.data.get('user_id')
     comment   = request.data.get('comment', '')
     try:
         status = statusoption.objects.filter(name__iexact='Awaiting Approval').first()
-        assignment.objects.filter(id=assign_id).update(status=status, comments=comment)
+        
+        # Security: check ownership
+        qs = assignment.objects.filter(id=assign_id, deleted=False)
+        if user_id:
+             qs = qs.filter(assigned_to_id=user_id)
+
+        updated = qs.update(status=status, comments=comment)
+        if not updated:
+             return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+
         return Response({"status": "success"})
     except Exception as e:
         return Response({"status": "error", "message": str(e)}, status=400)
+
+def _run_overdue_check_logic():
+    """
+    Core logic for identifying overdue tasks and flagging them.
+    Can be called from views or background workers.
+    """
+    now = timezone.now()
+    try:
+        overdue_status, _ = statusoption.objects.get_or_create(name='Overdue')
+        # Logic: deadline < now AND status NOT completed
+        qs = assignment.objects.filter(
+            deleted=False, 
+            deadline__lt=now
+        ).exclude(status__name__iexact='Completed').exclude(status__name__iexact='Overdue')
+        
+        for asgn in qs:
+            asgn.status = overdue_status
+            if not asgn.notified_overdue:
+                 asgn.notified_overdue = True
+                 _add_notif_logic(
+                     asgn.assigned_to_id, 
+                     "TASK OVERDUE", 
+                     f"⚠️ The task '{asgn.task.title}' has missed its deadline and is now marked as Overdue."
+                 )
+            asgn.save()
+    except Exception as e:
+        _err("OVERDUE-CORE", str(e))
 
 @api_view(['POST'])
 def check_overdue(request):
     """
     Manually triggers an overdue check (for sync purposes).
     """
-    today = date.today()
     try:
-        overdue_status, _ = statusoption.objects.get_or_create(name='Overdue')
-        qs = assignment.objects.filter(
-            deleted=False, 
-            deadline__lt=today, 
-            notified_overdue=False
-        ).exclude(status__name__iexact='Completed')
-        
-        count = 0
-        for asgn in qs:
-            asgn.status = overdue_status
-            asgn.notified_overdue = True
-            asgn.save()
-            count += 1
-            
-        return Response({"status": "sync_complete", "updated": count})
+        _run_overdue_check_logic()
+        return Response({"status": "sync_complete"})
     except Exception as e:
         _err("OVERDUE-CHECK", str(e), exc=True)
         return Response({"status": "error", "message": str(e)}, status=500)

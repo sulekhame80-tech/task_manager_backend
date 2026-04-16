@@ -8,7 +8,10 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ['id', 'user_id', 'name', 'email', 'role', 'phone', 'status', 'profile_image']
 
 class TaskTemplateSerializer(serializers.ModelSerializer):
-    priority = serializers.CharField(source='priority.name', read_only=True)
+    priority = serializers.SerializerMethodField()
+    
+    def get_priority(self, obj):
+        return obj.priority.name if obj.priority else 'None'
     
     class Meta:
         model = task_management
@@ -19,10 +22,20 @@ class AssignmentSerializer(serializers.ModelSerializer):
     task_desc = serializers.CharField(source='task.description', read_only=True)
     user_name = serializers.CharField(source='assigned_to.name', read_only=True)
     
-    # Map to names as expected by frontend
-    priority = serializers.CharField(source='task.priority.name', read_only=True)
-    status = serializers.CharField(source='status.name', read_only=True)
+    # Map to names as expected by frontend with null-safety
+    title = serializers.CharField(source='task.title', read_only=True)
+    priority = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
     
+    def get_priority(self, obj):
+        try:
+            return obj.task.priority.name if obj.task.priority else 'None'
+        except Exception:
+            return 'None'
+
+    def get_status(self, obj):
+        return obj.status.name if obj.status else 'Pending'
+
     # Critical for Frontend ID mapping
     task_id = serializers.IntegerField(source='task.id', read_only=True)
     emp_id = serializers.IntegerField(source='assigned_to.id', read_only=True)
@@ -31,8 +44,8 @@ class AssignmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = assignment
         fields = [
-            'id', 'task', 'task_id', 'assigned_to', 'emp_id', 'user_id', 'status', 
-            'task_title', 'task_desc', 'user_name', 
+            'id', 'task', 'task_id', 'assigned_to', 'emp_id', 'user_id', 
+            'title', 'task_title', 'task_desc', 'user_name', 
             'priority', 'status',
             'start_date', 'deadline', 'end_date', 'comments'
         ]
