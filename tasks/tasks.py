@@ -8,30 +8,37 @@ logger = logging.getLogger(__name__)
 
 def monitor_assignments_lifecycle():
     """
-    Unified Monitoring Task (RUNS EVERY 10 SECONDS)
-    Detects unstarted tasks and overdue deadlines, triggering popups ONCE.
+    Unified Monitoring Task (CLOCK SYNCED)
+    Detects unstarted tasks and overdue deadlines, triggering summarized alerts.
     """
-    logger.info("Starting lifecycle monitoring check...")
+    logger.info("Starting lifecycle monitoring check (BULK)...")
     try:
-        # 1. NOT STARTED Alert
+        from django.utils import timezone
+        now = timezone.now()
+
+        # Find the primary administrator to receive alerts
+        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+        admin_id = admin.id if admin else 1
+
+        # 1. NOT STARTED Bulk Alert
         unstarted = assignment.objects.filter(
             status__name__iexact='Pending', 
             start_date__isnull=True, 
             notified_start=False,
             deleted=False
-        ).select_related('task', 'assigned_to')
-        for a in unstarted:
-            # Find the primary administrator to receive alerts
-            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
-            admin_id = admin.id if admin else 1
-            notification.objects.create(user_id=admin_id, title="TASK ALERT", message=f"⚠ Emp {a.assigned_to.id} has NOT STARTED Task {a.task.title}")
-            a.notified_start = True
-            a.save()
-            logger.info(f"Alerted: Not Started for Assign ID {a.id}")
+        )
+        if unstarted.count() > 0:
+            count = unstarted.count()
+            notification.objects.create(
+                user_id=admin_id, 
+                title="TASK ALERT", 
+                message=f"⚠ {count} tasks have NOT BEEN STARTED yet by employees."
+            )
+            # Mark all as notified in bulk
+            unstarted.update(notified_start=True)
+            logger.info(f"Bulk Alerted: {count} unstarted tasks.")
 
-        # 2. OVERDUE Alert
-        from django.utils import timezone
-        now = timezone.now()
+        # 2. OVERDUE Bulk Alert
         status_overdue, _ = statusoption.objects.get_or_create(name='Overdue')
         overdue_qs = assignment.objects.filter(
             deleted=False,
@@ -39,16 +46,17 @@ def monitor_assignments_lifecycle():
             notified_overdue=False
         ).exclude(status__name__iexact='Completed')
 
-        # Find the primary administrator to receive alerts
-        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
-        admin_id = admin.id if admin else 1
-
-        for a in overdue_qs:
-            notification.objects.create(user_id=admin_id, title="OVERDUE ALERT", message=f"🚨 OVERDUE: Task {a.task.title} delayed by User {a.assigned_to.name}")
-            a.status = status_overdue
-            a.notified_overdue = True
-            a.save()
-            logger.info(f"Alerted: Overdue for Assign ID {a.id}")
+        if overdue_qs.count() > 0:
+            count = overdue_qs.count()
+            notification.objects.create(
+                user_id=admin_id, 
+                title="OVERDUE ALERT", 
+                message=f"🚨 SYSTEM ALERT: {count} tasks are now OVERDUE."
+            )
+            # Mark all as notified and update status in bulk
+            overdue_qs.update(status=status_overdue, notified_overdue=True)
+            logger.info(f"Bulk Alerted: {count} overdue tasks.")
+            
     except Exception as e:
         logger.error(f"Error in monitor_assignments_lifecycle: {e}")
 

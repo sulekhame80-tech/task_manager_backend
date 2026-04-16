@@ -17,10 +17,14 @@ def automation_loop():
     # 🚀 1. Startup Delay
     time.sleep(10)
     
+    import random
     last_run_min = -1
 
     while True:
         try:
+            # 🚀 0. Random Jitter (Staggers multiple workers)
+            time.sleep(random.random() * 3)
+
             now = datetime.now()
             current_min = now.minute
 
