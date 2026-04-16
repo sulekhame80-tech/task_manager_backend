@@ -59,4 +59,5 @@ urlpatterns = [
     path('check-overdue/', views.check_overdue),
     path('system-check/', views.run_system_check),
     path('pulse/', views.get_pulse),
+    path('assignments/bulk-status/', views.bulk_update_template_assignments),
 ]

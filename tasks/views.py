@@ -486,8 +486,8 @@ def update_task_template(request):
 
         for field, value in updates.items():
             if field == 'priority':
-                p = priorityoption.objects.filter(name__iexact=value).first()
-                if p: task.priority = p
+                p, _ = priorityoption.objects.get_or_create(name=value)
+                task.priority = p
             elif hasattr(task, field):
                 setattr(task, field, value)
         
@@ -1244,4 +1244,53 @@ def get_pulse(request):
         })
     except Exception as e:
         _err("PULSE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def bulk_update_template_assignments(request):
+    """
+    Updates the status of ALL active (non-deleted) assignments for a given
+    template task_id. Used by Master Control to push a status change to every
+    employee assigned to that template.
+    """
+    task_id    = request.data.get('task_id')
+    new_status = request.data.get('status')
+
+    if not task_id or not new_status:
+        return Response({"status": "error", "message": "task_id and status are required"}, status=400)
+
+    try:
+        status_obj, _ = statusoption.objects.get_or_create(name=new_status)
+
+        updated = assignment.objects.filter(
+            task_id=task_id,
+            deleted=False
+        ).exclude(
+            status__name__iexact='Completed'  # Never override already-completed work
+        ).update(status=status_obj)
+
+        # Notify each affected employee
+        affected = assignment.objects.filter(
+            task_id=task_id, deleted=False, status=status_obj
+        ).select_related('assigned_to', 'task')
+
+        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+        admin_id = admin.id if admin else 1
+
+        for a in affected:
+            _add_notif_logic(
+                a.assigned_to.id,
+                "TASK STATUS UPDATED",
+                f"📋 Your task '{a.task.title}' status has been updated to: {new_status}"
+            )
+
+        _add_notif_logic(
+            admin_id,
+            "BULK STATUS UPDATE",
+            f"✅ Status of '{updated}' assignment(s) for task #{task_id} set to '{new_status}'"
+        )
+
+        return Response({"status": "success", "updated": updated})
+    except Exception as e:
+        _err("BULK-STATUS", str(e), exc=True)
         return Response({"status": "error", "message": str(e)}, status=500)
