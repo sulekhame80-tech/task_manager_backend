@@ -22,8 +22,9 @@ def automation_loop():
 
     while True:
         try:
-            # 🚀 0. Random Jitter (Staggers multiple workers)
-            time.sleep(random.random() * 3)
+            # 🚀 0. Wider Jitter (Staggers multiple workers)
+            # Increased to 15s to reduce concurrency collisions on SQLite
+            time.sleep(random.random() * 15)
 
             now = datetime.now()
             current_min = now.minute
@@ -33,48 +34,25 @@ def automation_loop():
                 time.sleep(5)
                 continue
 
-            # 🛠️ 2. Singleton Guard (Leader Election)
-            # We use a hidden HEARTBEAT in system_log (NOT notifications) to ensure only one worker runs.
-            from .models import app_user, system_log
-            
-            # Check if anyone already took this minute slot
-            from django.utils import timezone
-            from datetime import timedelta
-            cutoff = timezone.now() - timedelta(seconds=55)
-            
-            already_run = system_log.objects.filter(
-                action__startswith="[SYS_HEARTBEAT]", 
-                timestamp__gte=cutoff
-            ).exists()
+            # 🛠️ 2. PRECISION GUARD
+            # We generate a unique ID for this specific minute and slot.
+            day_str = now.strftime("%Y-%m-%d")
+            # All workers target the SAME Slot-ID for a given minute.
+            slot_id = f"{day_str}_{now.hour:02d}:{current_min:02d}"
 
-            if already_run:
-                # Another worker is already handling this minute slot
-                last_run_min = current_min
-                continue
-
-            # Attempt to claim the slot
-            try:
-                admin = app_user.objects.filter(role__iexact='admin').first()
-                admin_id = admin.id if admin else 1
-                # Save to system_log ONLY (Audit trail, no popups)
-                system_log.objects.create(user_id=admin_id, action=f"[SYS_HEARTBEAT] Worker {current_min} active")
-            except Exception:
-                last_run_min = current_min
-                continue
-
-            logger.info(f"[ENGINE] Leading minute slot: {current_min}")
+            logger.info(f"[ENGINE] Evaluating slot: {slot_id}")
 
             # 📊 3. Exclusive Slots
             # Multiples of 10 (:00, :10, :20...) -> SUMMARY + NAG
             if current_min % 10 == 0:
-                logger.info(f"[ENGINE] Slot {current_min}: Generating Summary & Nag...")
-                generate_admin_summary()
-                trigger_overdue_recurring_nag()
+                logger.info(f"[ENGINE] Processing Slot {slot_id}: Summary & Nag...")
+                generate_admin_summary(slot_id=slot_id)
+                trigger_overdue_recurring_nag() # This handles its own logic inside
             
             # Multiples of 5 (BUT NOT 10) (:05, :15, :25...) -> PRIMARY OVERDUE
             elif current_min % 5 == 0:
-                logger.info(f"[ENGINE] Slot {current_min}: Running Primary Overdue Check...")
-                monitor_assignments_lifecycle()
+                logger.info(f"[ENGINE] Processing Slot {slot_id}: Primary Overdue...")
+                monitor_assignments_lifecycle(slot_id=slot_id)
 
             # 🧹 4. System Maintenance (Every hour at :01)
             if current_min == 1:

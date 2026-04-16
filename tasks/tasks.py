@@ -6,52 +6,70 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-def monitor_assignments_lifecycle():
+def monitor_assignments_lifecycle(slot_id=None):
     """
-    Unified Monitoring Task (CLOCK SYNCED)
-    Detects unstarted tasks and overdue deadlines, triggering summarized alerts.
+    Unified Monitoring Task (PRECISION CLOCK SYNC)
+    Detects unstarted tasks and overdue deadlines, triggering one detailed alert per slot.
     """
-    logger.info("Starting lifecycle monitoring check (BULK)...")
+    logger.info(f"Checking lifecycle for slot: {slot_id}")
     try:
         from django.utils import timezone
+        from .models import system_log
         now = timezone.now()
+
+        # 🛠️ GLOBAL SLOT GUARD (Leader Election)
+        if slot_id:
+            # We use system_log.get_or_create to ensure only ONE worker processes this slot globally
+            lock_action = f"[SLOT_LOCK] {slot_id}"
+            _, created = system_log.objects.get_or_create(action=lock_action)
+            if not created:
+                logger.info(f"Slot {slot_id} already processed by another worker. Standing down.")
+                return
 
         # Find the primary administrator to receive alerts
         admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
         admin_id = admin.id if admin else 1
 
-        # 1. NOT STARTED Bulk Alert
+        # 1. NOT STARTED Bulk Detailed Alert
         unstarted = assignment.objects.filter(
             status__name__iexact='Pending', 
             start_date__isnull=True, 
             notified_start=False,
             deleted=False
-        )
+        ).select_related('task', 'assigned_to')
+        
         if unstarted.count() > 0:
             count = unstarted.count()
+            # Collect details
+            details = ", ".join([f"{a.task.title} ({a.assigned_to.name})" for a in unstarted[:5]])
+            if count > 5: details += "..."
+            
             notification.objects.create(
                 user_id=admin_id, 
                 title="TASK ALERT", 
-                message=f"⚠ {count} tasks have NOT BEEN STARTED yet by employees."
+                message=f"⚠ {count} tasks NOT STARTED: {details}"
             )
-            # Mark all as notified in bulk
             unstarted.update(notified_start=True)
             logger.info(f"Bulk Alerted: {count} unstarted tasks.")
 
-        # 2. OVERDUE Bulk Alert
+        # 2. OVERDUE Bulk Detailed Alert
         status_overdue, _ = statusoption.objects.get_or_create(name='Overdue')
         overdue_qs = assignment.objects.filter(
             deleted=False,
             deadline__lt=now,
             notified_overdue=False
-        ).exclude(status__name__iexact='Completed')
+        ).exclude(status__name__iexact='Completed').select_related('task', 'assigned_to')
 
         if overdue_qs.count() > 0:
             count = overdue_qs.count()
+            # Collect details
+            details = ", ".join([f"{a.task.title} ({a.assigned_to.name})" for a in overdue_qs[:5]])
+            if count > 5: details += "..."
+
             notification.objects.create(
                 user_id=admin_id, 
                 title="OVERDUE ALERT", 
-                message=f"🚨 SYSTEM ALERT: {count} tasks are now OVERDUE."
+                message=f"🚨 OVERDUE ({count}): {details}"
             )
             # Mark all as notified and update status in bulk
             overdue_qs.update(status=status_overdue, notified_overdue=True)
@@ -60,9 +78,16 @@ def monitor_assignments_lifecycle():
     except Exception as e:
         logger.error(f"Error in monitor_assignments_lifecycle: {e}")
 
-def generate_admin_summary():
-    """ 📊 Generates a 10-minute summary of all active workloads. """
+def generate_admin_summary(slot_id=None):
+    """ 📊 Generates a 10-minute summary of all active workloads with a Slot-Lock. """
     try:
+        from .models import system_log
+        if slot_id:
+            lock_action = f"[SUMMARY_LOCK] {slot_id}"
+            _, created = system_log.objects.get_or_create(action=lock_action)
+            if not created:
+                return
+
         pending = assignment.objects.filter(status__name__iexact='Pending', deleted=False).count()
         active = assignment.objects.filter(status__name__iexact='In Progress', deleted=False).count()
         overdue = assignment.objects.filter(status__name__iexact='Overdue', deleted=False).count()
