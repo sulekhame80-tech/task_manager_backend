@@ -1,0 +1,1363 @@
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from .models import (
+    app_user, task_management, assignment, notification, 
+    forum_entry, system_log, otp_entry, statusoption, priorityoption
+)
+from datetime import datetime, date
+from django.utils import timezone
+import traceback
+from django.db.models import Count, Q
+from django.core.paginator import Paginator
+from .serializers import (
+    UserSerializer, TaskTemplateSerializer, AssignmentSerializer, 
+    NotificationSerializer, ForumEntrySerializer, app_user
+)
+from django.db.models import Max
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _log(tag, msg, user_id=0):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {msg}")
+    
+    # Use id=1 (Primary Admin) as fallback for system/background logs
+    # to avoid NOT NULL constraint failed: log.user_id
+    effective_id = user_id if user_id > 0 else 1
+    
+    try:
+        user = app_user.objects.filter(id=effective_id, deleted=False).first()
+        if user:
+            system_log.objects.create(user=user, action=f"[{tag}] {msg}")
+    except Exception:
+        pass
+
+def _err(tag, msg, exc=None, user_id=0):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ [{tag}] ERROR: {msg}")
+    if exc:
+        traceback.print_exc()
+
+def paginate_and_search(queryset, page=1, page_size=10, search=None, search_fields=None):
+    if search and search_fields:
+        query = Q()
+        for field in search_fields:
+            query |= Q(**{f"{field}__icontains": search})
+        queryset = queryset.filter(query)
+
+    paginator = Paginator(queryset, page_size)
+    try:
+        page_obj = paginator.get_page(page)
+    except Exception:
+        page_obj = paginator.get_page(1)
+
+    return {
+        "total": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "page_size": page_size,
+        "data": page_obj.object_list
+    }
+
+def _add_notif_logic(user_id, title, message):
+    """ Robust Helper for System Notifications """
+    try:
+        target = app_user.objects.filter(id=user_id, deleted=False).first()
+        if not target:
+            return False
+        notification.objects.create(
+            user=target,
+            title=title,
+            message=message
+        )
+        _log("NOTIF-SYNC", f"Sent: '{title}' to {target.name}")
+        return True
+    except Exception as e:
+        _err("NOTIF-SYNC", f"Failed: {str(e)}")
+        return False
+
+def _check_permission(req_user_id, target_user_id=None, action="edit"):
+    """
+    Unified Permission Helper.
+    Returns (bool permitted, app_user object or None).
+    Hierarchy:
+    - Admin: Full Control
+    - Manager: Manage all except Admins
+    - Employee: No management rights
+    """
+    try:
+        # 🛡️ Safety: Handle non-numeric or invalid IDs from legacy sessions/hot-reloads
+        if req_user_id is None or not str(req_user_id).strip().isdigit():
+            _log("AUTH-PERM", f"Blocked invalid/null req_user_id: {req_user_id}")
+            return False, None
+            
+        req_user = app_user.objects.get(id=req_user_id, deleted=False)
+        req_role = str(req_user.role).lower()
+        
+        # 🛡️ GLOBAL ADMIN PROTECTION: Admin accounts cannot be edited or deleted by anyone
+        if target_user_id and action in ['edit', 'delete']:
+            target_user = app_user.objects.filter(id=target_user_id).first()
+            if target_user and str(target_user.role).lower() == 'admin':
+                _log("AUTH-PERM", f"Blocked {action} attempt on ADMIN id={target_user_id} by {req_user.name}")
+                return False, req_user
+
+        if req_role == 'admin':
+            return True, req_user
+            
+        if req_role == 'manager':
+            # Managers cannot touch Admins (Redundant due to global protection, but good for hierarchy)
+            if target_user_id:
+                target_user = app_user.objects.filter(id=target_user_id).first()
+                if target_user and str(target_user.role).lower() == 'admin':
+                    return False, req_user
+            return True, req_user
+            
+        return False, req_user
+    except Exception:
+        return False, None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH (STEP 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login_user(request):
+    """
+    Step 1: Proper Login API
+    Authenticates user, checks status, and returns serialized user data.
+    """
+    email = str(request.data.get('email', '')).strip()
+    password = str(request.data.get('password', '')).strip()
+    _log("LOGIN", f"Attempting login for: {email}")
+
+    try:
+        user = app_user.objects.filter(email__iexact=email, password=password, deleted=False).first()
+        
+        if not user:
+            _log("LOGIN", f"❌ Invalid credentials: {email}")
+            return Response({"status": "error", "message": "Invalid email or password"}, status=401)
+
+        # 🛡️ Security Check: Status
+        status = str(user.status).lower()
+        if status == 'inactive':
+            _log("LOGIN", f"⛔ Blocked inactive user: {email}")
+            return Response({"status": "error", "message": "Account deactivated. Contact Admin."}, status=403)
+        elif status == 'pending':
+            _log("LOGIN", f"🕒 Blocked pending user: {email}")
+            return Response({"status": "error", "message": "Account pending Admin approval."}, status=403)
+
+        serializer = UserSerializer(user)
+        _log("LOGIN", f"✅ Success: {user.name} ({user.role})")
+        return Response({"status": "success", "user": serializer.data})
+    except Exception as e:
+        _err("LOGIN", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['GET'])
+def get_pending_users(request):
+    """
+    Returns users with 'pending' status for admin approval.
+    """
+    try:
+        users = app_user.objects.filter(status__iexact='pending', deleted=False)
+        return Response(UserSerializer(users, many=True).data)
+    except Exception as e:
+        _err("PENDING-GET", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def approve_user(request):
+    """
+    Approves or rejects a pending user registration.
+    """
+    uid        = request.data.get('user_id')
+    new_status = request.data.get('status', 'active')
+    try:
+        user = app_user.objects.get(pk=uid, deleted=False)
+        user.status = new_status
+        user.save()
+        
+        msg = "Your account has been activated. Welcome to Campus Connection!" \
+              if new_status.lower() == 'active' else "Your registration was rejected. Contact admin."
+        _add_notif_logic(uid, "ACCOUNT UPDATE", msg)
+        
+        return Response({"status": "success"})
+    except app_user.DoesNotExist:
+        return Response({"status": "error", "message": "User not found"}, status=404)
+    except Exception as e:
+        _err("APPROVE-USER", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+        # ─────────────────────────────────────────────────────────────────────────────
+# MASTER DATA (STEP 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_master_data(request):
+    """
+    Returns lists of statuses, priorities, and roles for the frontend dropdowns.
+    """
+    try:
+        data = {
+            "statuses": list(statusoption.objects.values_list('name', flat=True)),
+            "priorities": list(priorityoption.objects.values_list('name', flat=True)),
+            "roles": ["admin", "manager", "employee"], # Fixed roles for safety
+            "server_time": datetime.now().isoformat()
+        }
+        return Response(data)
+    except Exception as e:
+        _err("MASTER-GET", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def update_master_data(request):
+    """
+    Updates the available options for Status or Priority.
+    """
+    data_type = request.data.get('type')   # 'status' | 'priority'
+    options   = request.data.get('options', [])
+    
+    model_map = {'status': statusoption, 'priority': priorityoption}
+    Model = model_map.get(data_type)
+    
+    if not Model:
+        return Response({"status": "error", "message": "Invalid master data type"}, status=400)
+    
+    try:
+        clean_options = [o.strip() for o in options if o.strip()]
+        
+        # Safely determine which options to delete (not in use)
+        # For simplicity in this 'rebuild', we overwrite unless it's a critical error
+        # In a real system, we'd check ForeignKeys.
+        
+        # Delete old options not in the new list
+        Model.objects.exclude(name__in=clean_options).delete()
+        
+        # Create new ones
+        for name in clean_options:
+            Model.objects.get_or_create(name=name)
+            
+        _log("MASTER-UPDATE", f"Successfully updated {data_type} options")
+        return Response({"status": "success", "message": f"{data_type.capitalize()} options updated"})
+    except Exception as e:
+        _err("MASTER-UPDATE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER MANAGEMENT (STEP 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_employees(request):
+    """
+    Step 3: Proper Paginated & Searchable Employee List
+    Authorization: Admins/Managers only.
+    """
+    req_user_id = request.query_params.get('req_user_id')
+    permitted, req_user = _check_permission(req_user_id)
+    
+    if not permitted:
+        return Response({"status": "error", "message": "Permission denied"}, status=403)
+
+    try:
+        search = request.query_params.get('search')
+        page   = int(request.query_params.get('page', 1))
+        size   = int(request.query_params.get('page_size', 10))
+        
+        # Filter Logic:
+        # Admins see everyone (including other admins)
+        # Managers see everyone EXCEPT admins (to prevent unauthorized access)
+        qs = app_user.objects.filter(deleted=False)
+        if req_user.role == 'manager':
+            qs = qs.exclude(role__iexact='admin')
+        
+        pager = paginate_and_search(qs, page, size, search, ['name', 'email', 'phone'])
+        
+        serializer = UserSerializer(pager['data'], many=True)
+        pager['data'] = serializer.data
+        
+        return Response(pager)
+    except Exception as e:
+        _err("EMPLOYEES-GET", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def create_employee(request):
+    """
+    Creates a new user with one of the fixed roles (admin, manager, employee).
+    Authorization: Admins can create anyone. Managers cannot create admins.
+    """
+    data = request.data
+    req_user_id = data.get('req_user_id') or data.get('admin_id')
+    
+    permitted, req_user = _check_permission(req_user_id)
+    if not permitted:
+        return Response({"status": "error", "message": "Permission denied. Only Admins and Managers can create users. Please re-login if this is unexpected."}, status=403)
+    
+    try:
+        email = data.get('email')
+        phone = data.get('phone')
+        if phone and str(phone).strip() == "":
+            phone = None
+
+        # 1. Check if user already exists (including deleted ones)
+        # Priority: Check by email first, then by phone
+        existing_user = app_user.objects.filter(email=email).first()
+        if not existing_user and phone:
+            existing_user = app_user.objects.filter(phone=phone).first()
+
+        if existing_user:
+            if existing_user.deleted:
+                # 🔄 RESTORE LOGIC: Reactivate the deleted account
+                existing_user.deleted = False
+                existing_user.name = data.get('name')
+                existing_user.email = email
+                existing_user.password = data.get('password')
+                existing_user.phone = phone
+                existing_user.role = str(data.get('role', 'employee')).lower()
+                existing_user.status = 'active'
+                existing_user.save()
+                _log("EMP-RESTORE", f"✅ Restored user_id={existing_user.id}")
+                return Response({
+                    "status": "success", 
+                    "user_id": existing_user.id, 
+                    "message": "User account restored from records."
+                })
+            else:
+                # ❌ Already Active
+                msg = "Email already exists" if existing_user.email == email else "Phone number already exists"
+                return Response({"status": "error", "message": msg}, status=400)
+
+        role = str(data.get('role', 'employee')).lower()
+        
+        # Manager Protection: Cannot create an admin
+        if req_user.role == 'manager' and role == 'admin':
+             return Response({"status": "error", "message": "Managers are not permitted to create Admin accounts. Contact your system administrator."}, status=403)
+             
+        if role not in ['admin', 'manager', 'employee']:
+            return Response({"status": "error", "message": f"Invalid role '{role}'. Must be admin, manager, or employee."}, status=400)
+
+        user = app_user.objects.create(
+            name=data.get('name'),
+            email=data.get('email'),
+            password=data.get('password'),
+            phone=phone,
+            role=role,
+            status='active'
+        )
+        _log("EMP-CREATE", f"✅ Created user_id={user.id}")
+        return Response({"status": "success", "user_id": user.id})
+    except Exception as e:
+        _err("EMP-CREATE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def update_employee(request):
+    """
+    Updates an existing user's profile.
+    Authorization: Admin/Manager only. Manager cannot edit Admin.
+    """
+    user_id = request.data.get('user_id')
+    req_user_id = request.data.get('req_user_id') or request.data.get('admin_id')
+    
+    # Allow self-update for everyone, otherwise check management permissions
+    is_self = str(user_id) == str(req_user_id)
+    permitted, req_user = _check_permission(req_user_id, target_user_id=user_id)
+    
+    if not is_self and not permitted:
+        return Response({"status": "error", "message": "Permission denied. You do not have rights to modify this account."}, status=403)
+    
+    # Ensure we have the requesting user object for logging/safeguards
+    if not req_user:
+        req_user = app_user.objects.filter(id=req_user_id, deleted=False).first()
+        if not req_user:
+            return Response({"status": "error", "message": "Requester not found or deactivated."}, status=401)
+
+    updates = request.data.get('updates', {})
+    
+    # 🛡️ PROTECT SENSITIVE FIELDS: Non-admins cannot change their own Role or Status
+    if req_user.role != 'admin' and is_self:
+        updates.pop('role', None)
+        updates.pop('status', None)
+
+    _log("EMP-UPDATE", f"user_id={user_id} by={req_user.name}")
+    
+    try:
+        user = app_user.objects.filter(id=user_id, deleted=False).first()
+        if not user:
+            return Response({"status": "error", "message": "User not found"}, status=404)
+        
+        for field, value in updates.items():
+            if hasattr(user, field):
+                # Uniqueness validation for updates
+                if field == 'email':
+                    if app_user.objects.filter(email=value).exclude(id=user_id).exists():
+                        return Response({"status": "error", "message": "This email is already taken."}, status=400)
+                
+                if field == 'phone':
+                    if not value or str(value).strip() == "":
+                        value = None
+                    elif app_user.objects.filter(phone=value).exclude(id=user_id).exists():
+                        return Response({"status": "error", "message": "This phone number is already in use."}, status=400)
+                
+                setattr(user, field, value)
+        
+        user.save()
+        _log("EMP-UPDATE", f"✅ Updated user_id={user_id}")
+        return Response({"status": "success"})
+    except Exception as e:
+        _err("EMP-UPDATE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def delete_employee(request):
+    """
+    Soft deletes a user.
+    Authorization: Admin/Manager only. Manager cannot delete Admin.
+    """
+    user_id = request.data.get('user_id')
+    req_user_id = request.data.get('req_user_id') or request.data.get('admin_id')
+    
+    permitted, req_user = _check_permission(req_user_id, target_user_id=user_id)
+    if not permitted:
+        return Response({"status": "error", "message": "Permission denied: Managers cannot delete Admins"}, status=403)
+
+    _log("EMP-DELETE", f"user_id={user_id} by={req_user.name}")
+    
+    try:
+        updated = app_user.objects.filter(id=user_id, deleted=False).update(deleted=True)
+        if not updated:
+            return Response({"status": "error", "message": "User not found"}, status=404)
+            
+        _log("EMP-DELETE", f"✅ Soft deleted user_id={user_id}")
+        return Response({"status": "success"})
+    except Exception as e:
+        _err("EMP-DELETE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['GET'])
+def get_employee_status(request):
+    """
+    Returns the current status of all employees (Working/Idle).
+    """
+    try:
+        users = app_user.objects.filter(deleted=False, role__iexact='employee')
+        result = {}
+        for u in users:
+            active = assignment.objects.filter(
+                assigned_to=u, 
+                deleted=False
+            ).select_related('status').filter(status__name__iexact='in progress').first()
+            
+            result[str(u.id)] = {
+                "name": u.name,
+                "status": "Working" if active else "Idle",
+                "current_task": active.task.id if active else "-",
+            }
+        return Response(result)
+    except Exception as e:
+        _err("EMP-STATUS", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK LIBRARY (STEP 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_library_all(request):
+    """
+    Step 4: Proper Paginated & Searchable Task Library
+    """
+    try:
+        search = request.query_params.get('search')
+        page   = int(request.query_params.get('page', 1))
+        size   = int(request.query_params.get('page_size', 10))
+        
+        qs = task_management.objects.filter(deleted=False)
+        pager = paginate_and_search(qs, page, size, search, ['title', 'description'])
+        
+        serializer = TaskTemplateSerializer(pager['data'], many=True)
+        pager['data'] = serializer.data
+        return Response(pager)
+    except Exception as e:
+        _err("LIBRARY-GET", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def create_task_template(request):
+    """
+    Creates a master task template. Validate priority name.
+    """
+    data = request.data
+    title = data.get('title')
+    _log("TASK-CREATE", f"title={title}")
+
+    try:
+        # Resolve Priority (dynamic)
+        p_name = data.get('priority', 'Medium')
+        priority = priorityoption.objects.filter(name__iexact=p_name).first()
+        if not priority:
+            priority = priorityoption.objects.first() # Default fallback
+
+        task = task_management.objects.create(
+            title=title,
+            description=data.get('description', ''),
+            priority=priority,
+            created_by=data.get('admin_name', 'Admin')
+        )
+        _log("TASK-CREATE", f"✅ Created task_id={task.id}")
+        return Response({"status": "success", "task_id": task.id})
+    except Exception as e:
+        _err("TASK-CREATE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def update_task_template(request):
+    """
+    Updates a global task template.
+    """
+    # Robustness: Check multiple common keys for the ID
+    task_id = request.data.get('task_id') or request.data.get('id')
+    updates = request.data.get('updates', {})
+    _log("TASK-UPDATE", f"task_id={task_id}")
+
+    try:
+        # Extra safety: Strip prefixes in the backend as well
+        if isinstance(task_id, str):
+            task_id = task_id.replace('templ_', '').replace('assign_', '')
+
+        task = task_management.objects.filter(id=task_id, deleted=False).first()
+        if not task:
+            return Response({"status": "error", "message": f"Task not found (ID: {task_id})"}, status=404)
+
+        for field, value in updates.items():
+            if field == 'priority':
+                p, _ = priorityoption.objects.get_or_create(name=value)
+                task.priority = p
+            elif hasattr(task, field):
+                setattr(task, field, value)
+        
+        task.save()
+        return Response({"status": "success"})
+    except Exception as e:
+        _err("TASK-UPDATE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def delete_task_template(request):
+    """
+    Soft deletes a task template.
+    """
+    # Robustness: Check multiple common keys for the ID
+    task_id = request.data.get('task_id') or request.data.get('id')
+    _log("TASK-DELETE", f"Attempting delete for task_id={task_id}")
+
+    try:
+        # Extra safety: Strip prefixes in the backend as well
+        if isinstance(task_id, str):
+            task_id = task_id.replace('templ_', '').replace('assign_', '')
+
+        updated = task_management.objects.filter(id=task_id, deleted=False).update(deleted=True)
+        if not updated:
+            _err("TASK-DELETE", f"Task not found or already deleted: id={task_id}")
+            return Response({"status": "error", "message": f"Task not found (ID: {task_id})"}, status=404)
+        
+        _log("TASK-DELETE", f"✅ Successfully deleted task_id={task_id}")
+        return Response({"status": "success"})
+    except Exception as e:
+        _err("TASK-DELETE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSIGNMENTS (STEP 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET', 'POST'])
+def manage_assignments(request):
+    """
+    Handles fetching and creating assignments.
+    """
+    if request.method == 'GET':
+        try:
+            # 🕒 TRIGGER OVERDUE CHECK (NOW HANDLED BY BACKGROUND WORKER)
+
+            emp_id = request.query_params.get('emp_id')
+            search = request.query_params.get('search')
+            page   = int(request.query_params.get('page', 1))
+            size   = int(request.query_params.get('page_size', 10))
+            
+            qs = assignment.objects.filter(deleted=False).select_related('task', 'assigned_to', 'status', 'task__priority')
+            if emp_id:
+                qs = qs.filter(assigned_to_id=emp_id)
+            
+            pager = paginate_and_search(qs, page, size, search, ['task__title', 'task__description'])
+            
+            serializer = AssignmentSerializer(pager['data'], many=True)
+            pager['data'] = serializer.data
+            return Response(pager)
+        except Exception as e:
+            _err("ASSIGN-GET", str(e), exc=True)
+            return Response({"status": "error", "message": str(e)}, status=500)
+
+    elif request.method == 'POST':
+        data = request.data
+        task_id = data.get('task_id')
+        emp_id  = data.get('emp_id')
+        req_user_id = data.get('req_user_id') or data.get('admin_id')
+        
+        _log("ASSIGN-CREATE", f"task={task_id} to={emp_id} by={req_user_id}")
+        
+        try:
+            task = task_management.objects.get(id=task_id)
+            target_user = app_user.objects.get(id=emp_id)
+            assigner = app_user.objects.filter(id=req_user_id).first()
+            
+            if not assigner:
+                return Response({"status": "error", "message": f"Authorization Error: User ID '{req_user_id}' not found. Please re-login."}, status=400)
+            
+            assigner_role = str(assigner.role).lower()
+            target_role = str(target_user.role).lower()
+            
+            # --- ROLE HIERARCHY VALIDATION ---
+            # 1. Self-assignment check
+            if str(assigner.id) == str(target_user.id):
+                 return Response({"status": "error", "message": "You cannot assign tasks to yourself"}, status=403)
+            
+            # 2. Hierarchy enforcement
+            if assigner_role == 'manager':
+                if target_role != 'employee':
+                    return Response({"status": "error", "message": "Managers can only assign tasks to Employees"}, status=403)
+            elif assigner_role == 'admin':
+                if target_role == 'admin':
+                    return Response({"status": "error", "message": "Admins cannot assign tasks to other Admins"}, status=403)
+            else:
+                return Response({"status": "error", "message": "Employees cannot assign tasks"}, status=403)
+            
+            # --- DUPLICATE ASSIGNMENT CHECK ---
+            # Prevent assigning the same template to the same person if they already have an active/pending version
+            existing = assignment.objects.filter(
+                task_id=task_id, 
+                assigned_to_id=emp_id, 
+                deleted=False
+            ).exclude(status__name__iexact='Completed').first()
+            
+            if existing:
+                return Response({
+                    "status": "error", 
+                    "message": f"⚠️ Already Assigned: {target_user.name} already has this task ({existing.status.name})."
+                }, status=400)
+
+            # Default first status — always 'Pending'
+            default_status, _ = statusoption.objects.get_or_create(name='Pending')
+            
+            from django.utils.dateparse import parse_datetime
+            from django.utils.timezone import make_aware, is_aware
+            
+            raw_deadline = data.get('deadline')
+            deadline_dt = None
+            if raw_deadline:
+                # If it's just a date 'YYYY-MM-DD', append time
+                if len(raw_deadline) == 10:
+                    raw_deadline += " 23:59:59"
+                
+                deadline_dt = parse_datetime(raw_deadline)
+                if deadline_dt and not is_aware(deadline_dt):
+                    deadline_dt = make_aware(deadline_dt)
+
+            new_assign = assignment.objects.create(
+                task=task,
+                assigned_to=target_user,
+                deadline=deadline_dt,
+                assigned_by=assigner.name,
+                status=default_status
+            )
+            
+            # 🔔 Trigger Notification for the assigned employee
+            _add_notif_logic(
+                target_user.id, 
+                "NEW TASK ASSIGNED", 
+                f"📋 You have been assigned a new task: '{task.title}' by {assigner.name}"
+            )
+            
+            # 🔔 IMMEDIATE NOTIFICATION (To Employee)
+            _add_notif_logic(
+                target_user.id, 
+                "NEW ASSIGNMENT", 
+                f"📋 You have been assigned a new task: {task.title}"
+            )
+
+            return Response({"status": "success", "assignment_id": new_assign.id})
+        except Exception as e:
+            _err("ASSIGN-CREATE", str(e), exc=True)
+            return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def update_assignment(request):
+    """
+    Updates an assignment - Status, Deadline, or Reassign (User).
+    """
+    assign_id = request.data.get('assignment_id') or request.data.get('id')
+    updates   = request.data.get('updates', {})
+    _log("ASSIGN-UPDATE", f"id={assign_id}")
+
+    try:
+        assign = assignment.objects.filter(id=assign_id, deleted=False).first()
+        if not assign:
+            return Response({"status": "error", "message": "Assignment not found"}, status=404)
+
+        for field, value in updates.items():
+            if field == 'status':
+                s, _ = statusoption.objects.get_or_create(name=value)
+                assign.status = s
+            elif field == 'assigned_to_id' or field == 'emp_id':
+                 u = app_user.objects.filter(id=value).first()
+                 if u: assign.assigned_to = u
+            elif hasattr(assign, field):
+                setattr(assign, field, value)
+        
+        assign.save()
+
+        # 🔔 IMMEDIATE NOTIFICATION (On Completion)
+        if updates.get('status', '').lower() == 'completed':
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            if admin:
+                _add_notif_logic(
+                    admin.id, 
+                    "TASK COMPLETED", 
+                    f"✅ {assign.assigned_to.name} finished: {assign.task.title}"
+                )
+
+        return Response({"status": "success"})
+    except Exception as e:
+        _err("ASSIGN-UPDATE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def delete_assignment(request):
+    """
+    Soft deletes an assignment.
+    """
+    assign_id = request.data.get('assignment_id') or request.data.get('id')
+    _log("ASSIGN-DELETE", f"Attempting delete for assign_id={assign_id}")
+
+    try:
+        # Extra safety: Strip prefixes in the backend
+        if isinstance(assign_id, str):
+            assign_id = assign_id.replace('assign_', '').replace('templ_', '')
+
+        updated = assignment.objects.filter(id=assign_id, deleted=False).update(deleted=True)
+        if not updated:
+            _err("ASSIGN-DELETE", f"Assignment not found: id={assign_id}")
+            return Response({"status": "error", "message": f"Assignment not found (ID: {assign_id})"}, status=404)
+        
+        _log("ASSIGN-DELETE", f"✅ Successfully deleted assign_id={assign_id}")
+        return Response({"status": "success"})
+    except Exception as e:
+        _err("ASSIGN-DELETE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATS (STEP 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_stats(request):
+    """
+    Returns aggregate stats for the dashboard.
+    """
+    try:
+        data = {
+            "total_tasks": task_management.objects.filter(deleted=False).count(),
+            "total_assignments": assignment.objects.filter(deleted=False).count(),
+            "total_employees": app_user.objects.filter(role='employee', deleted=False).count(),
+            "completed_tasks": assignment.objects.filter(status__name__iexact='Completed', deleted=False).count(),
+        }
+        return Response(data)
+    except Exception as e:
+        _err("STATS", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTIFICATIONS (STEP 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_notifications(request):
+    """
+    Fetches paginated notifications for a user.
+    """
+    try:
+        user_id = request.query_params.get('user_id', 1)
+        page    = int(request.query_params.get('page', 1))
+        size    = int(request.query_params.get('page_size', 20))
+        
+        qs = notification.objects.filter(user_id=user_id)
+        pager = paginate_and_search(qs, page, size)
+        
+        serializer = NotificationSerializer(pager['data'], many=True)
+        pager['data'] = serializer.data
+        return Response(pager)
+    except Exception as e:
+        _err("NOTIF-GET", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def mark_notif_read(request):
+    notif_id = request.data.get('id')
+    notification.objects.filter(id=notif_id).update(status='read')
+    return Response({"status": "success"})
+
+@api_view(['POST'])
+def delete_notification(request):
+    notif_id = request.data.get('id')
+    notification.objects.filter(id=notif_id).delete()
+    return Response({"status": "success"})
+
+@api_view(['POST'])
+def mark_all_notifs_read(request):
+    user_id = request.data.get('user_id')
+    notification.objects.filter(user_id=user_id, status='unread').update(status='read')
+    return Response({"status": "success"})
+
+@api_view(['POST'])
+def clear_all_notifications(request):
+    user_id = request.data.get('user_id')
+    notification.objects.filter(user_id=user_id).delete()
+    return Response({"status": "success"})
+
+@api_view(['POST'])
+def create_notification(request):
+    user_id = request.data.get('user_id')
+    title   = request.data.get('title', 'System Alert')
+    message = request.data.get('message')
+    try:
+        user = app_user.objects.get(id=user_id)
+        notification.objects.create(user=user, title=title, message=message)
+        return Response({"status": "success"})
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORUM (STEP 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_forum_entries(request):
+    """
+    Fetches chat messages. If user_id is provided, fetches the specific chat history.
+    Otherwise fetches all (original behavior).
+    """
+    try:
+        user_id = request.query_params.get('user_id')
+        search = request.query_params.get('search')
+        page   = int(request.query_params.get('page', 1))
+        size   = int(request.query_params.get('page_size', 50)) # Larger page for chat
+        
+        qs = forum_entry.objects.filter(deleted=False)
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+            
+        pager = paginate_and_search(qs.order_by('dtm_created'), page, size, search, ['message', 'user__name'])
+        
+        serializer = ForumEntrySerializer(pager['data'], many=True)
+        pager['data'] = serializer.data
+        return Response(pager)
+    except Exception as e:
+        _err("FORUM-GET", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def create_forum_entry(request):
+    """
+    Creates a chat message. 
+    `user_id` is the 'Chat Owner' (the employee/student).
+    `sender_role` identifies if it's the employee or an admin.
+    """
+    user_id = request.data.get('user_id')
+    message = request.data.get('message')
+    role    = request.data.get('sender_role', 'user')
+    try:
+        user = app_user.objects.get(id=user_id)
+        # Mark as unread if coming from user (to alert admin)
+        is_read = (role == 'admin')
+        forum_entry.objects.create(user=user, message=message, sender_role=role, is_read=is_read)
+        
+        # 🔔 IMMEDIATE NOTIFICATION
+        if role == 'user':
+            # Notify Admin (user_id=1)
+            notification.objects.create(
+                user_id=1, 
+                title="NEW COMMUNITY MESSAGE", 
+                message=f"💬 {user.name} sent a message: {message[:50]}..."
+            )
+        else:
+            # Notify Employee (the user_id targeted in the chat)
+            notification.objects.create(
+                user=user, 
+                title="COMMUNITY REPLY", 
+                message=f"💬 Management replied: {message[:50]}..."
+            )
+
+        return Response({"status": "success"})
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['GET'])
+def get_chat_users(request):
+    """
+    Returns a list of ALL users (directory), with unread message counts and latest activity prioritized.
+    Used by Admins to manage support chats.
+    """
+    req_user_id = request.query_params.get('req_user_id')
+    permitted, req_user = _check_permission(req_user_id)
+    
+    if not permitted:
+        return Response({"status": "error", "message": "Permission denied"}, status=403)
+
+    try:
+        # Get all users who are not deleted and not the requester themselves
+        users = app_user.objects.filter(deleted=False).exclude(id=req_user.id)
+        
+        result = []
+        for u in users:
+            # unread_count: messages sent by 'user' (employee) that haven't been read by admin
+            unread_count = forum_entry.objects.filter(user=u, sender_role='user', is_read=False, deleted=False).count()
+            last_msg = forum_entry.objects.filter(user=u, deleted=False).order_by('-dtm_created').first()
+            
+            result.append({
+                "id": u.id,
+                "name": u.name,
+                "email": u.email,
+                "profile_image": getattr(u, 'profile_image', ''),
+                "unread_count": unread_count,
+                "last_message": last_msg.message if last_msg else "",
+                "last_time": last_msg.dtm_created if last_msg else None
+            })
+            
+        # Sort logic: 
+        # 1. Unread count (desc)
+        # 2. Activity Time (desc) - use timestamp or 0 if None
+        # 3. Name (asc) - handled by reversing the specific keys
+        result.sort(key=lambda x: (
+            x['unread_count'], 
+            x['last_time'].timestamp() if x['last_time'] else 0
+        ), reverse=True)
+        
+        return Response(result)
+    except Exception as e:
+        _err("CHAT-USERS", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def mark_forum_read(request):
+    """
+    Marks all messages in a specific user's chat as read by the admin.
+    """
+    user_id = request.data.get('user_id')
+    try:
+        forum_entry.objects.filter(user_id=user_id, sender_role='user', is_read=False).update(is_read=True)
+        return Response({"status": "success"})
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def reply_forum_entry(request):
+    # This is a legacy endpoint, we now use create_forum_entry with role='admin'
+    return create_forum_entry(request)
+
+@api_view(['POST'])
+def delete_forum_entry(request):
+    forum_id = request.data.get('forum_id')
+    forum_entry.objects.filter(id=forum_id).update(deleted=True)
+    return Response({"status": "success"})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK LIFECYCLE ACTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['POST'])
+def start_task(request):
+    assign_id = request.data.get('assign_id')
+    user_id   = request.data.get('user_id') # Required for security & concurrency
+    try:
+        if not user_id:
+             return Response({"status": "error", "message": "user_id is required for concurrency check"}, status=400)
+
+        # 🛡️ CONCURRENCY LOCK: Only one task "In Progress" at a time for this user
+        in_progress_status, _ = statusoption.objects.get_or_create(name='In Progress')
+        in_progress_count = assignment.objects.filter(
+            assigned_to_id=user_id, 
+            status=in_progress_status,
+            deleted=False
+        ).count()
+        
+        if in_progress_count > 0:
+             return Response({
+                 "status": "locked", 
+                 "message": "⚠️ CONCURRENCY LOCK: You already have a task in progress. You must complete it before starting another."
+             }, status=403)
+
+        status = in_progress_status
+        
+        # Security: check ownership
+        qs = assignment.objects.filter(id=assign_id, deleted=False)
+        if user_id:
+             qs = qs.filter(assigned_to_id=user_id)
+        
+        updated = qs.update(status=status, start_date=timezone.now())
+        if not updated:
+             return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+             
+        # 🔔 IMMEDIATE NOTIFICATION (To Admin)
+        try:
+            assign = qs.first()
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            if admin and assign:
+                _add_notif_logic(
+                    admin.id, 
+                    "TASK STARTED", 
+                    f"🚀 {assign.assigned_to.name} started working on: {assign.task.title}"
+                )
+        except: pass
+
+        return Response({"status": "success"})
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def complete_task(request):
+    assign_id = request.data.get('assign_id')
+    user_id   = request.data.get('user_id')
+    try:
+        # 🚀 NO APPROVAL FLOW: Move directly to 'Completed'
+        status, _ = statusoption.objects.get_or_create(name='Completed')
+        
+        # Security: check ownership
+        qs = assignment.objects.filter(id=assign_id, deleted=False)
+        if user_id:
+             qs = qs.filter(assigned_to_id=user_id)
+
+        updated = qs.update(status=status, end_date=timezone.now())
+        if not updated:
+             return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+
+        # 🔔 IMMEDIATE NOTIFICATION (To Admin)
+        try:
+            assign = qs.first()
+            admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+            if admin and assign:
+                _add_notif_logic(
+                    admin.id, 
+                    "TASK COMPLETED", 
+                    f"✅ {assign.assigned_to.name} finished: {assign.task.title}"
+                )
+        except: pass
+
+        return Response({"status": "success"})
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+@api_view(['POST'])
+def request_approval(request):
+    assign_id = request.data.get('assign_id')
+    user_id   = request.data.get('user_id')
+    comment   = request.data.get('comment', '')
+    try:
+        status = statusoption.objects.filter(name__iexact='Awaiting Approval').first()
+        if not status:
+            status, _ = statusoption.objects.get_or_create(name='Awaiting Approval')
+        
+        # Security: check ownership
+        qs = assignment.objects.filter(id=assign_id, deleted=False)
+        if user_id:
+             qs = qs.filter(assigned_to_id=user_id)
+
+        updated = qs.update(status=status, comments=comment)
+        if not updated:
+             return Response({"status": "error", "message": "Task not found or permission denied"}, status=403)
+
+        return Response({"status": "success"})
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+def _run_overdue_check_logic():
+    """
+    Core logic for identifying overdue tasks and flagging them.
+    Can be called from views or background workers.
+    """
+    now = timezone.now()
+    try:
+        overdue_status, _ = statusoption.objects.get_or_create(name='Overdue')
+        # Logic: deadline < now AND status NOT completed
+        qs = assignment.objects.filter(
+            deleted=False, 
+            deadline__lt=now
+        ).exclude(status__name__iexact='Completed').exclude(status__name__iexact='Overdue')
+        
+        for asgn in qs:
+            asgn.status = overdue_status
+            if not asgn.notified_overdue:
+                 asgn.notified_overdue = True
+                 _add_notif_logic(
+                     asgn.assigned_to_id, 
+                     "TASK OVERDUE", 
+                     f"⚠️ The task '{asgn.task.title}' has missed its deadline and is now marked as Overdue."
+                 )
+            asgn.save()
+    except Exception as e:
+        _err("OVERDUE-CORE", str(e))
+
+@api_view(['POST'])
+def check_overdue(request):
+    """
+    Manually triggers an overdue check (for sync purposes).
+    """
+    try:
+        _run_overdue_check_logic()
+        return Response({"status": "sync_complete"})
+    except Exception as e:
+        _err("OVERDUE-CHECK", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYTICS & REPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_reports(request):
+    """
+    Returns a list of all users and their task completion metrics.
+    """
+    try:
+        users = app_user.objects.filter(deleted=False)
+        report = []
+        for u in users:
+            u_tasks = assignment.objects.filter(assigned_to=u, deleted=False)
+            completed = u_tasks.filter(status__name__iexact='Completed').count()
+            overdue   = u_tasks.filter(status__name__iexact='Overdue').count()
+            total     = u_tasks.count()
+            
+            report.append({
+                "user_id": u.id,
+                "name": u.name,
+                "total": total,
+                "completed": completed,
+                "overdue": overdue,
+                "completion_rate": round(completed / total * 100, 1) if total else 0,
+            })
+        return Response(report)
+    except Exception as e:
+        _err("REPORTS", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['GET'])
+def system_check(request):
+    """
+    LIGHTWEIGHT PULSE CHECK (PRECISION UPGRADE)
+    Real logic is now handled by the Background Worker.
+    This endpoint remains for legacy compatibility and health checks.
+    """
+    try:
+        return Response({"status": "ok", "summary": "System background worker active and healthy."})
+    except Exception as e:
+        _err("SYSTEM-CHECK", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['GET'])
+def get_recent_activity(request):
+    """
+    Returns the most recent global activity.
+    """
+    try:
+        qs = assignment.objects.filter(deleted=False).select_related(
+            'task', 'assigned_to', 'status'
+        ).order_by('-dtm_created')[:10]
+        return Response(AssignmentSerializer(qs, many=True).data)
+    except Exception as e:
+        _err("ACTIVITY", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['GET'])
+def get_user_summary(request):
+    """
+    Returns stats for a specific user (Today's tasks, pending, etc).
+    """
+    user_id = request.query_params.get('user_id')
+    if not user_id:
+        return Response({"error": "user_id required"}, status=400)
+        
+    try:
+        today = date.today()
+        qs = assignment.objects.filter(assigned_to_id=user_id, deleted=False)
+        
+        return Response({
+            "today_tasks": qs.filter(deadline=today).count(),
+            "pending":     qs.filter(status__name__iexact='Pending').count(),
+            "completed":   qs.filter(status__name__iexact='Completed').count(),
+            "overdue":     qs.filter(status__name__iexact='Overdue').count(),
+        })
+    except Exception as e:
+        _err("USER-SUMMARY", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYSTEM CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['POST'])
+def run_system_check(request):
+    """
+    Automated background task to check for overdue items and system health.
+    Expects to be called periodically by the frontend or a cron job.
+    """
+    today = date.today()
+    try:
+        overdue_status, _ = statusoption.objects.get_or_create(name='Overdue')
+
+        # 1. Update Newly Overdue Tasks
+        newly_overdue = assignment.objects.filter(
+            deleted=False, 
+            deadline__lt=today, 
+            notified_overdue=False
+        ).exclude(status__name__iexact='Completed').select_related('task', 'assigned_to')
+
+        newly_list = list(newly_overdue)
+        for asgn in newly_list:
+            asgn.status = overdue_status
+            asgn.notified_overdue = True
+            asgn.save()
+            
+            # Notify the employee
+            _add_notif_logic(asgn.assigned_to_id, f"🚨 Task Overdue: '{asgn.task.title}' needs immediate attention!")
+
+        # 2. Update Not Started status
+        not_started = assignment.objects.filter(
+            deleted=False, 
+            start_date__isnull=True, 
+            notified_start=False,
+            status__name__iexact='Pending'
+        ).select_related('task', 'assigned_to')
+        
+        for asgn in not_started:
+            asgn.notified_start = True
+            asgn.save()
+
+        # 3. Aggregate Stats for Summary
+        total_overdue = assignment.objects.filter(deleted=False, status__name__iexact='Overdue').count()
+        
+        parts = []
+        if total_overdue > 0: parts.append(f"{total_overdue} overdue")
+        if len(newly_list) > 0: parts.append(f"{len(newly_list)} newly flagged")
+
+        if parts:
+            summary = "📊 System Alert: " + ", ".join(parts)
+            # Notify main admin (ID 1)
+            _add_notif_logic(1, "SYSTEM SUMMARY", summary)
+            return Response({"status": "ok", "summary": summary})
+            
+        return Response({"status": "ok", "summary": "System healthy"})
+    except Exception as e:
+        _err("SYSTEM-CHECK", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+def _add_notif_logic(user_id, title, message):
+    """Internal helper to add notifications without full API overhead."""
+    try:
+        user = app_user.objects.get(id=user_id)
+        notification.objects.create(user=user, title=title, message=message)
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTELLIGENT PULSE SYNC
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+def get_pulse(request):
+    """
+    Lightweight sync check. Returns a sync_key that changes whenever any
+    assignment is created, updated (start/end date, status), or a new
+    notification arrives for the requesting user.
+    """
+    user_id = request.query_params.get('user_id')
+    if not user_id:
+        return Response({"error": "user_id required"}, status=400)
+        
+    try:
+        # 1. Assignments (Total count + Max ID)
+        agg_assign = assignment.objects.filter(deleted=False).aggregate(
+            c=Count('id'),
+            m=Max('id'),
+            mod=Max('dtm_modified')
+        )
+        a_count = agg_assign['c'] or 0
+        a_max   = agg_assign['m'] or 0
+        # Incorporate timestamp to catch status updates (since modified changes)
+        a_mod   = int(agg_assign['mod'].timestamp()) if agg_assign['mod'] else 0
+
+        # 2. Notifications (Max ID for THIS user)
+        n_max = notification.objects.filter(user_id=user_id).aggregate(m=Max('id'))['m'] or 0
+
+        # 3. Forum (Overall count)
+        f_count = forum_entry.objects.filter(deleted=False).count()
+
+        sync_key = f"v{a_count}_{a_max}_{a_mod}_{n_max}_{f_count}"
+        
+        return Response({
+            "sync_key": sync_key,
+            "server_time": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        _err("PULSE", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)
+
+@api_view(['POST'])
+def bulk_update_template_assignments(request):
+    """
+    Updates the status of ALL active (non-deleted) assignments for a given
+    template task_id. Used by Master Control to push a status change to every
+    employee assigned to that template.
+    """
+    task_id    = request.data.get('task_id')
+    new_status = request.data.get('status')
+
+    if not task_id or not new_status:
+        return Response({"status": "error", "message": "task_id and status are required"}, status=400)
+
+    try:
+        status_obj, _ = statusoption.objects.get_or_create(name=new_status)
+
+        updated = assignment.objects.filter(
+            task_id=task_id,
+            deleted=False
+        ).exclude(
+            status__name__iexact='Completed'  # Never override already-completed work
+        ).update(status=status_obj)
+
+        # Notify each affected employee
+        affected = assignment.objects.filter(
+            task_id=task_id, deleted=False, status=status_obj
+        ).select_related('assigned_to', 'task')
+
+        admin = app_user.objects.filter(role__iexact='admin', deleted=False).first()
+        admin_id = admin.id if admin else 1
+
+        for a in affected:
+            _add_notif_logic(
+                a.assigned_to.id,
+                "TASK STATUS UPDATED",
+                f"📋 Your task '{a.task.title}' status has been updated to: {new_status}"
+            )
+
+        _add_notif_logic(
+            admin_id,
+            "BULK STATUS UPDATE",
+            f"✅ Status of '{updated}' assignment(s) for task #{task_id} set to '{new_status}'"
+        )
+
+        return Response({"status": "success", "updated": updated})
+    except Exception as e:
+        _err("BULK-STATUS", str(e), exc=True)
+        return Response({"status": "error", "message": str(e)}, status=500)

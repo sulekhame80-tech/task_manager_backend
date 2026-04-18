@@ -1,0 +1,35 @@
+# ─── Python / Django ───────────────────────────────────
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ─── Virtual Environment ───────────────────────────────
+venv/
+env/
+.env
+*.env
+
+# ─── Google Credentials (NEVER commit this) ────────────
+*.json
+!render.yaml
+
+# ─── Django ────────────────────────────────────────────
+# db.sqlite3
+# *db.sqlite3
+*.rar
+*.zip
+*.7z
+.env
+staticfiles/
+__pycache__/
+*.pyc
+
+# ─── IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
