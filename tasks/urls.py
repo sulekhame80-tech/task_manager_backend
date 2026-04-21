@@ -7,7 +7,7 @@ urlpatterns = [
     path('master/update/', views.update_master_data),
     
     path('employees/', views.get_employees),
-    path('employees/create/', views.create_employee),
+    path('employees/create/', views.create_user),
     path('employees/update/', views.update_employee),
     path('employees/delete/', views.delete_employee),
 

@@ -95,14 +95,19 @@ def _check_permission(req_user_id, target_user_id=None, action="edit"):
         req_user = app_user.objects.get(id=req_user_id, deleted=False)
         req_role = str(req_user.role).lower()
         
-        # 🛡️ GLOBAL ADMIN PROTECTION: Admin accounts cannot be edited or deleted by anyone
+        # 🛡️ GLOBAL ADMIN PROTECTION: Admin accounts cannot be edited or deleted by anyone OTHER than themselves
         if target_user_id and action in ['edit', 'delete']:
-            target_user = app_user.objects.filter(id=target_user_id).first()
-            if target_user and str(target_user.role).lower() == 'admin':
-                _log("AUTH-PERM", f"Blocked {action} attempt on ADMIN id={target_user_id} by {req_user.name}")
-                return False, req_user
+            if str(req_user_id) != str(target_user_id):
+                target_user = app_user.objects.filter(id=target_user_id).first()
+                if target_user and str(target_user.role).lower() == 'admin':
+                    _log("AUTH-PERM", f"Blocked {action} attempt on ADMIN id={target_user_id} by {req_user.name}")
+                    return False, req_user
 
         if req_role == 'admin':
+            return True, req_user
+            
+        # 🛡️ Employees & Managers editing their own profiles
+        if target_user_id and str(req_user_id) == str(target_user_id):
             return True, req_user
             
         if req_role == 'manager':
@@ -127,6 +132,12 @@ def login_user(request):
     """
     Step 1: Proper Login API
     Authenticates user, checks status, and returns serialized user data.
+    
+    Example Payload:
+    {
+        "email": "employee@example.com",
+        "password": "password123"
+    }
     """
     email = str(request.data.get('email', '')).strip()
     password = str(request.data.get('password', '')).strip()
@@ -171,6 +182,12 @@ def get_pending_users(request):
 def approve_user(request):
     """
     Approves or rejects a pending user registration.
+    
+    Example Payload:
+    {
+        "user_id": "3",
+        "status": "active"
+    }
     """
     uid        = request.data.get('user_id')
     new_status = request.data.get('status', 'active')
@@ -215,6 +232,12 @@ def get_master_data(request):
 def update_master_data(request):
     """
     Updates the available options for Status or Priority.
+    
+    Example Payload:
+    {
+        "type": "status",
+        "options": ["Pending", "In Progress", "Completed", "Overdue", "Awaiting Approval"]
+    }
     """
     data_type = request.data.get('type')   # 'status' | 'priority'
     options   = request.data.get('options', [])
@@ -248,6 +271,8 @@ def update_master_data(request):
 # ─────────────────────────────────────────────────────────────────────────────
 # USER MANAGEMENT (STEP 3)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
 
 @api_view(['GET'])
 def get_employees(request):
@@ -284,18 +309,38 @@ def get_employees(request):
         return Response({"status": "error", "message": str(e)}, status=500)
 
 @api_view(['POST'])
-def create_employee(request):
+@permission_classes([AllowAny])
+def create_user(request):
     """
     Creates a new user with one of the fixed roles (admin, manager, employee).
     Authorization: Admins can create anyone. Managers cannot create admins.
+    If req_user_id is absent, allows bypassing RBAC (intended for Postman manually).
+    
+    Example Payload:
+    {
+        "req_user_id": "1",
+        "name": "Jane Employee",
+        "email": "jane@example.com",
+        "password": "securepassword",
+        "phone": "555-0102",
+        "role": "employee"
+    }
     """
     data = request.data
     req_user_id = data.get('req_user_id') or data.get('admin_id')
+    role = str(data.get('role', 'employee')).lower()
     
-    permitted, req_user = _check_permission(req_user_id)
-    if not permitted:
-        return Response({"status": "error", "message": "Permission denied. Only Admins and Managers can create users. Please re-login if this is unexpected."}, status=403)
+    if req_user_id:
+        permitted, req_user = _check_permission(req_user_id)
+        if not permitted:
+            return Response({"status": "error", "message": "Permission denied. Only Admins and Managers can create users. Please re-login if this is unexpected."}, status=403)
+        # Manager Protection: Cannot create an admin
+        if req_user.role == 'manager' and role == 'admin':
+             return Response({"status": "error", "message": "Managers are not permitted to create Admin accounts. Contact your system administrator."}, status=403)
     
+    if role not in ['admin', 'manager', 'employee']:
+        return Response({"status": "error", "message": f"Invalid role '{role}'. Must be admin, manager, or employee."}, status=400)
+
     try:
         if app_user.objects.filter(email=data.get('email'), deleted=False).exists():
             return Response({"status": "error", "message": "Email already exists"}, status=400)
@@ -306,15 +351,6 @@ def create_employee(request):
                 return Response({"status": "error", "message": "Phone number already is in use by another user"}, status=400)
         else:
             phone = None # Ensure NULL for database uniqueness
-
-        role = str(data.get('role', 'employee')).lower()
-        
-        # Manager Protection: Cannot create an admin
-        if req_user.role == 'manager' and role == 'admin':
-             return Response({"status": "error", "message": "Managers are not permitted to create Admin accounts. Contact your system administrator."}, status=403)
-             
-        if role not in ['admin', 'manager', 'employee']:
-            return Response({"status": "error", "message": f"Invalid role '{role}'. Must be admin, manager, or employee."}, status=400)
 
         user = app_user.objects.create(
             name=data.get('name'),
@@ -335,15 +371,29 @@ def update_employee(request):
     """
     Updates an existing user's profile.
     Authorization: Admin/Manager only. Manager cannot edit Admin.
+    
+    Example Payload:
+    {
+        "user_id": "2",
+        "req_user_id": "1",
+        "updates": {"name": "Jane Doe"}
+    }
     """
-    user_id = request.data.get('user_id')
-    req_user_id = request.data.get('req_user_id') or request.data.get('admin_id')
+    user_id = request.data.get('user_id') #user
+    req_user_id = request.data.get('req_user_id') or request.data.get('admin_id') #admin
     
     permitted, req_user = _check_permission(req_user_id, target_user_id=user_id)
     if not permitted:
         return Response({"status": "error", "message": "Permission denied: Managers cannot modify Admins"}, status=403)
 
     updates = request.data.get('updates', {})
+    
+    # 🛡️ SECURITY: Prevent non-admins from privilege escalation via self-edits
+    if str(req_user.role).lower() != 'admin':
+        updates.pop('role', None)
+        updates.pop('status', None)
+        updates.pop('deleted', None)
+
     _log("EMP-UPDATE", f"user_id={user_id} by={req_user.name}")
     
     try:
@@ -371,6 +421,12 @@ def delete_employee(request):
     """
     Soft deletes a user.
     Authorization: Admin/Manager only. Manager cannot delete Admin.
+    
+    Example Payload:
+    {
+        "user_id": "2",
+        "req_user_id": "1"
+    }
     """
     user_id = request.data.get('user_id')
     req_user_id = request.data.get('req_user_id') or request.data.get('admin_id')
@@ -444,6 +500,14 @@ def get_library_all(request):
 def create_task_template(request):
     """
     Creates a master task template. Validate priority name.
+    
+    Example Payload:
+    {
+        "title": "Onboarding Module Review",
+        "description": "Please review the onboarding document.",
+        "priority": "High",
+        "admin_name": "Admin Name"
+    }
     """
     data = request.data
     title = data.get('title')
@@ -472,6 +536,12 @@ def create_task_template(request):
 def update_task_template(request):
     """
     Updates a global task template.
+    
+    Example Payload:
+    {
+        "task_id": "1",
+        "updates": {"priority": "Critical"}
+    }
     """
     task_id = request.data.get('task_id')
     updates = request.data.get('updates', {})
@@ -499,12 +569,21 @@ def update_task_template(request):
 def delete_task_template(request):
     """
     Soft deletes a task template.
+    
+    Example Payload:
+    {
+        "task_id": "1"
+    }
     """
     task_id = request.data.get('task_id')
     try:
-        updated = task_management.objects.filter(id=task_id, deleted=False).update(deleted=True)
-        if not updated:
-            return Response({"status": "error", "message": "Task not found"}, status=404)
+        updated_template = task_management.objects.filter(id=task_id, deleted=False).update(deleted=True)
+        # 🛡️ CASCADE: Also soft-delete all assignments linked to this template to prevent dangling tasks
+        updated_assignments = assignment.objects.filter(task_id=task_id, deleted=False).update(deleted=True)
+        
+        if not updated_template and not updated_assignments:
+            return Response({"status": "error", "message": "Task not found or already deleted"}, status=404)
+            
         return Response({"status": "success"})
     except Exception as e:
         _err("TASK-DELETE", str(e), exc=True)
@@ -518,6 +597,14 @@ def delete_task_template(request):
 def manage_assignments(request):
     """
     Handles fetching and creating assignments.
+    
+    Example Payload (POST):
+    {
+        "task_id": "1",
+        "emp_id": "2",
+        "req_user_id": "1",
+        "deadline": "2026-12-31"
+    }
     """
     if request.method == 'GET':
         try:
@@ -637,6 +724,12 @@ def manage_assignments(request):
 def update_assignment(request):
     """
     Updates an assignment - Status, Deadline, or Reassign (User).
+    
+    Example Payload:
+    {
+        "assignment_id": "1",
+        "updates": {"status": "Pending"}
+    }
     """
     assign_id = request.data.get('assignment_id') or request.data.get('id')
     updates   = request.data.get('updates', {})
@@ -678,6 +771,11 @@ def update_assignment(request):
 def delete_assignment(request):
     """
     Soft deletes an assignment.
+    
+    Example Payload:
+    {
+        "assignment_id": "1"
+    }
     """
     assign_id = request.data.get('assignment_id') or request.data.get('id')
     try:
@@ -736,30 +834,62 @@ def get_notifications(request):
 
 @api_view(['POST'])
 def mark_notif_read(request):
+    """
+    Example Payload:
+    {
+        "id": "1"
+    }
+    """
     notif_id = request.data.get('id')
     notification.objects.filter(id=notif_id).update(status='read')
     return Response({"status": "success"})
 
 @api_view(['POST'])
 def delete_notification(request):
+    """
+    Example Payload:
+    {
+        "id": "1"
+    }
+    """
     notif_id = request.data.get('id')
     notification.objects.filter(id=notif_id).delete()
     return Response({"status": "success"})
 
 @api_view(['POST'])
 def mark_all_notifs_read(request):
+    """
+    Example Payload:
+    {
+        "user_id": "2"
+    }
+    """
     user_id = request.data.get('user_id')
     notification.objects.filter(user_id=user_id, status='unread').update(status='read')
     return Response({"status": "success"})
 
 @api_view(['POST'])
 def clear_all_notifications(request):
+    """
+    Example Payload:
+    {
+        "user_id": "2"
+    }
+    """
     user_id = request.data.get('user_id')
     notification.objects.filter(user_id=user_id).delete()
     return Response({"status": "success"})
 
 @api_view(['POST'])
 def create_notification(request):
+    """
+    Example Payload:
+    {
+        "user_id": "2",
+        "title": "Welcome",
+        "message": "Welcome to Campus Connection."
+    }
+    """
     user_id = request.data.get('user_id')
     title   = request.data.get('title', 'System Alert')
     message = request.data.get('message')
@@ -805,6 +935,13 @@ def create_forum_entry(request):
     Creates a chat message. 
     `user_id` is the 'Chat Owner' (the employee/student).
     `sender_role` identifies if it's the employee or an admin.
+    
+    Example Payload:
+    {
+        "user_id": "2",
+        "message": "Hello Administrator",
+        "sender_role": "user"
+    }
     """
     user_id = request.data.get('user_id')
     message = request.data.get('message')
@@ -885,6 +1022,11 @@ def get_chat_users(request):
 def mark_forum_read(request):
     """
     Marks all messages in a specific user's chat as read by the admin.
+    
+    Example Payload:
+    {
+        "user_id": "2"
+    }
     """
     user_id = request.data.get('user_id')
     try:
@@ -900,6 +1042,12 @@ def reply_forum_entry(request):
 
 @api_view(['POST'])
 def delete_forum_entry(request):
+    """
+    Example Payload:
+    {
+        "forum_id": "1"
+    }
+    """
     forum_id = request.data.get('forum_id')
     forum_entry.objects.filter(id=forum_id).update(deleted=True)
     return Response({"status": "success"})
@@ -910,6 +1058,13 @@ def delete_forum_entry(request):
 
 @api_view(['POST'])
 def start_task(request):
+    """
+    Example Payload:
+    {
+        "assign_id": "1",
+        "user_id": "2"
+    }
+    """
     assign_id = request.data.get('assign_id')
     user_id   = request.data.get('user_id') # Required for security & concurrency
     try:
@@ -959,6 +1114,13 @@ def start_task(request):
 
 @api_view(['POST'])
 def complete_task(request):
+    """
+    Example Payload:
+    {
+        "assign_id": "1",
+        "user_id": "2"
+    }
+    """
     assign_id = request.data.get('assign_id')
     user_id   = request.data.get('user_id')
     try:
@@ -992,6 +1154,14 @@ def complete_task(request):
 
 @api_view(['POST'])
 def request_approval(request):
+    """
+    Example Payload:
+    {
+        "assign_id": "1",
+        "user_id": "2",
+        "comment": "Finished earlier than expected."
+    }
+    """
     assign_id = request.data.get('assign_id')
     user_id   = request.data.get('user_id')
     comment   = request.data.get('comment', '')
@@ -1044,6 +1214,9 @@ def _run_overdue_check_logic():
 def check_overdue(request):
     """
     Manually triggers an overdue check (for sync purposes).
+    
+    Example Payload:
+    {}
     """
     try:
         _run_overdue_check_logic()
@@ -1142,6 +1315,9 @@ def run_system_check(request):
     """
     Automated background task to check for overdue items and system health.
     Expects to be called periodically by the frontend or a cron job.
+    
+    Example Payload:
+    {}
     """
     today = date.today()
     try:
@@ -1250,6 +1426,12 @@ def bulk_update_template_assignments(request):
     Updates the status of ALL active (non-deleted) assignments for a given
     template task_id. Used by Master Control to push a status change to every
     employee assigned to that template.
+    
+    Example Payload:
+    {
+        "task_id": "1",
+        "status": "Paused"
+    }
     """
     task_id    = request.data.get('task_id')
     new_status = request.data.get('status')
