@@ -695,8 +695,8 @@ def manage_assignments(request):
             
             # 2. Hierarchy enforcement
             if assigner_role == 'manager':
-                if target_role != 'employee':
-                    return Response({"status": "error", "message": "Managers can only assign tasks to Employees"}, status=403)
+                if target_role not in ['employee', 'student']:
+                    return Response({"status": "error", "message": "Managers can only assign tasks to Employees or Students"}, status=403)
             elif assigner_role == 'admin':
                 if target_role == 'admin':
                     return Response({"status": "error", "message": "Admins cannot assign tasks to other Admins"}, status=403)
@@ -748,13 +748,6 @@ def manage_assignments(request):
                 "NEW TASK ASSIGNED", 
                 f"📋 You have been assigned a new task: '{task.title}' by {assigner.name}"
             )
-            
-            # 🔔 IMMEDIATE NOTIFICATION (To Employee)
-            _add_notif_logic(
-                target_user.id, 
-                "NEW ASSIGNMENT", 
-                f"📋 You have been assigned a new task: {task.title}"
-            )
 
             return Response({"status": "success", "assignment_id": new_assign.id})
         except Exception as e:
@@ -765,21 +758,39 @@ def manage_assignments(request):
 def update_assignment(request):
     """
     Updates an assignment - Status, Deadline, or Reassign (User).
+    Managers can only update status/dates for tasks assigned to them.
     
     Example Payload:
     {
         "assignment_id": "1",
+        "req_user_id": "2",
         "updates": {"status": "Pending"}
     }
     """
     assign_id = request.data.get('assignment_id') or request.data.get('id')
+    req_user_id = request.data.get('req_user_id')
     updates   = request.data.get('updates', {})
-    _log("ASSIGN-UPDATE", f"id={assign_id}")
+    _log("ASSIGN-UPDATE", f"id={assign_id} by={req_user_id}")
 
     try:
         assign = assignment.objects.filter(id=assign_id, deleted=False).first()
         if not assign:
             return Response({"status": "error", "message": "Assignment not found"}, status=404)
+
+        # 🛡️ SECURITY: Manager self-task restriction
+        if req_user_id:
+            req_user = app_user.objects.filter(id=req_user_id, deleted=False).first()
+            if req_user and req_user.role.lower() == 'manager' and str(assign.assigned_to_id) == str(req_user_id):
+                # Manager is updating their OWN task. 
+                # Allowed fields: status, start_date, end_date, comments.
+                # Restricted: deadline, assigned_to_id, task_id.
+                allowed = ['status', 'start_date', 'end_date', 'comments']
+                for key in list(updates.keys()):
+                    if key not in allowed:
+                        return Response({
+                            "status": "error", 
+                            "message": f"Permission denied: Managers cannot update '{key}' on tasks assigned to them."
+                        }, status=403)
 
         for field, value in updates.items():
             if field == 'status':
@@ -1027,7 +1038,15 @@ def get_chat_users(request):
 
     try:
         # Get all users who are not deleted and not the requester themselves
+        role = str(req_user.role).lower()
         users = app_user.objects.filter(deleted=False).exclude(id=req_user.id)
+        
+        if role == 'employee' or role == 'user':
+            # Employees can only see Admins and Managers
+            users = users.filter(role__in=['admin', 'manager'])
+        elif role == 'manager':
+            # Managers see everyone (Admins, other Managers, Employees)
+            pass
         
         result = []
         for u in users:
@@ -1079,8 +1098,32 @@ def mark_forum_read(request):
 
 @api_view(['POST'])
 def reply_forum_entry(request):
-    # This is a legacy endpoint, we now use create_forum_entry with role='admin'
-    return create_forum_entry(request)
+    """
+    Handles replies to forum entries.
+    Expected Payload: { "forum_id": "1", "reply": "...", "reply_by": "Admin" }
+    """
+    forum_id = request.data.get('forum_id')
+    reply_text = request.data.get('reply')
+    reply_by = request.data.get('reply_by', 'Admin')
+    
+    try:
+        entry = forum_entry.objects.get(id=forum_id)
+        entry.reply = reply_text
+        entry.status = 'resolved'
+        entry.save()
+        
+        # Notify the user who posted the message
+        _add_notif_logic(
+            entry.user.id, 
+            "COMMUNITY REPLY", 
+            f"💬 {reply_by} replied: {reply_text[:50]}..."
+        )
+        
+        return Response({"status": "success"})
+    except forum_entry.DoesNotExist:
+        return Response({"status": "error", "message": "Forum entry not found"}, status=404)
+    except Exception as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
 
 @api_view(['POST'])
 def delete_forum_entry(request):
