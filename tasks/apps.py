@@ -27,9 +27,12 @@ class TasksConfig(AppConfig):
         repair_live_database()
 
         # Seed required status options so start/complete always work
-        from .models import statusoption
-        for name in ['Pending', 'In Progress', 'Completed', 'Overdue', 'Awaiting Approval']:
-            statusoption.objects.get_or_create(name=name)
+        try:
+            from .models import statusoption
+            for name in ['Pending', 'In Progress', 'Completed', 'Overdue', 'Awaiting Approval']:
+                statusoption.objects.get_or_create(name=name)
 
-        from .background_worker import start_automation_engine
-        start_automation_engine()
+            from .background_worker import start_automation_engine
+            start_automation_engine()
+        except Exception as e:
+            logger.warning(f"[STARTUP] Could not initialize database/workers: {e}. This is normal during first-time migration.")
