@@ -574,6 +574,33 @@ def update_task_template(request):
                 setattr(task, field, value)
         
         task.save()
+
+        # [NEW] Cascading Completion logic
+        if 'status' in updates and updates['status'].lower() == 'completed':
+            try:
+                # Find all active assignments for this template that are NOT already completed
+                assignments_to_update = assignment.objects.filter(
+                    task=task,
+                    deleted=False
+                ).exclude(status__name__iexact='Completed')
+                
+                # Fetch user IDs for notifications before the update
+                affected_user_ids = list(assignments_to_update.values_list('assigned_to_id', flat=True))
+                
+                # Update them all to 'Completed'
+                assignments_to_update.update(status=task.status)
+                
+                # Send notifications to each affected employee
+                for user_id in affected_user_ids:
+                    _add_notif_logic(
+                        user_id,
+                        "TASK COMPLETED BY ADMIN",
+                        f"✅ The master task '{task.title}' has been marked as completed by the administrator. Status updated for all."
+                    )
+                _log("CASCADE-COMPLETION", f"Updated {len(affected_user_ids)} assignments for task {task_id}")
+            except Exception as e:
+                _err("CASCADE-COMPLETION", f"Error during cascading update: {str(e)}")
+
         return Response({"status": "success"})
     except Exception as e:
         _err("TASK-UPDATE", str(e), exc=True)
@@ -1459,12 +1486,13 @@ def bulk_update_template_assignments(request):
     try:
         status_obj, _ = statusoption.objects.get_or_create(name=new_status)
 
-        updated = assignment.objects.filter(
-            task_id=task_id,
-            deleted=False
-        ).exclude(
-            status__name__iexact='Completed'  # Never override already-completed work
-        ).update(status=status_obj)
+        # If setting to Completed, we include everyone who wasn't completed.
+        # Otherwise, we exclude already completed tasks to prevent overriding finished work.
+        query = assignment.objects.filter(task_id=task_id, deleted=False)
+        if new_status.lower() != 'completed':
+            query = query.exclude(status__name__iexact='Completed')
+            
+        updated = query.update(status=status_obj)
 
         # Notify each affected employee
         affected = assignment.objects.filter(
