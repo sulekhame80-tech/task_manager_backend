@@ -196,12 +196,16 @@ def cleanup_expired_otps():
 def cleanup_old_forum_messages():
     """Hourly: Soft-delete forum messages older than 24 hours."""
     try:
-        from django.utils import timezone
-        expiry = timezone.now() - timedelta(hours=24)
-        deleted, _ = forum_entry.objects.filter(
-            dtm_created__lt=expiry, deleted=False
-        ).update(deleted=True), None
-        logger.info(f"[CLEANUP] Archived old forum messages.")
+        # 🛡️ Message persistence enabled: Auto-deletion disabled by user request
+        logger.info("[CLEANUP-FORUM] Cleanup skipped (History persistence active).")
+        return
+        
+        # from django.utils import timezone
+        # expiry = timezone.now() - timedelta(hours=24)
+        # deleted, _ = forum_entry.objects.filter(
+        #     dtm_created__lt=expiry, deleted=False
+        # ).update(deleted=True), None
+        # logger.info(f"[CLEANUP] Archived old forum messages.")
     except Exception as e:
         logger.error(f"[CLEANUP-FORUM] Error: {e}", exc_info=True)
 

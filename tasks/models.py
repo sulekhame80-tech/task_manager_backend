@@ -41,6 +41,7 @@ class app_user(models.Model):
 
     remarks = models.TextField(null=True, blank=True)
     profile_image = models.TextField(null=True, blank=True) # Base64 string
+    last_seen = models.DateTimeField(null=True, blank=True, db_index=True)
 
     class Meta:
         db_table = 'user'

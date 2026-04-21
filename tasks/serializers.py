@@ -5,7 +5,7 @@ class UserSerializer(serializers.ModelSerializer):
     user_id = serializers.IntegerField(source='id', read_only=True)
     class Meta:
         model = app_user
-        fields = ['id', 'user_id', 'name', 'email', 'role', 'phone', 'status', 'profile_image']
+        fields = ['id', 'user_id', 'name', 'email', 'role', 'phone', 'status', 'profile_image', 'deleted']
 
 class TaskTemplateSerializer(serializers.ModelSerializer):
     priority = serializers.SerializerMethodField()

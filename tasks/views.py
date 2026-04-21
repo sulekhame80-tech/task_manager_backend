@@ -95,11 +95,14 @@ def _check_permission(req_user_id, target_user_id=None, action="edit"):
         req_user = app_user.objects.get(id=req_user_id, deleted=False)
         req_role = str(req_user.role).lower()
         
-        # 🛡️ GLOBAL ADMIN PROTECTION: Admin accounts cannot be edited or deleted by anyone OTHER than themselves
+        # 🛡️ GLOBAL ADMIN PROTECTION: Allow Admins to manage other Admins, but block everyone else.
         if target_user_id and action in ['edit', 'delete']:
             if str(req_user_id) != str(target_user_id):
                 target_user = app_user.objects.filter(id=target_user_id).first()
                 if target_user and str(target_user.role).lower() == 'admin':
+                    # Allow if requester is also an admin
+                    if req_role == 'admin':
+                        return True, req_user
                     _log("AUTH-PERM", f"Blocked {action} attempt on ADMIN id={target_user_id} by {req_user.name}")
                     return False, req_user
 
@@ -342,13 +345,13 @@ def create_user(request):
         return Response({"status": "error", "message": f"Invalid role '{role}'. Must be admin, manager, or employee."}, status=400)
 
     try:
-        if app_user.objects.filter(email=data.get('email'), deleted=False).exists():
-            return Response({"status": "error", "message": "Email already exists"}, status=400)
+        if app_user.objects.filter(email=data.get('email')).exists():
+            return Response({"status": "error", "message": "Email already exists in our records (possibly in a deactivated account)."}, status=400)
         
         phone = data.get('phone')
         if phone and str(phone).strip() != "":
-            if app_user.objects.filter(phone=phone, deleted=False).exists():
-                return Response({"status": "error", "message": "Phone number already is in use by another user"}, status=400)
+            if app_user.objects.filter(phone=phone).exists():
+                return Response({"status": "error", "message": "Phone number is already associated with another account (possibly deactivated)."}, status=400)
         else:
             phone = None # Ensure NULL for database uniqueness
 
@@ -948,8 +951,8 @@ def create_forum_entry(request):
     role    = request.data.get('sender_role', 'user')
     try:
         user = app_user.objects.get(id=user_id)
-        # Mark as unread if coming from user (to alert admin)
-        is_read = (role == 'admin')
+        # Mark as unread initially for the recipient
+        is_read = False
         forum_entry.objects.create(user=user, message=message, sender_role=role, is_read=is_read)
         
         # 🔔 IMMEDIATE NOTIFICATION
@@ -1001,7 +1004,8 @@ def get_chat_users(request):
                 "profile_image": getattr(u, 'profile_image', ''),
                 "unread_count": unread_count,
                 "last_message": last_msg.message if last_msg else "",
-                "last_time": last_msg.dtm_created if last_msg else None
+                "last_time": last_msg.dtm_created if last_msg else None,
+                "last_seen": u.last_seen
             })
             
         # Sort logic: 
@@ -1393,6 +1397,8 @@ def get_pulse(request):
         return Response({"error": "user_id required"}, status=400)
         
     try:
+        # Update presence
+        app_user.objects.filter(id=user_id).update(last_seen=timezone.now())
         # 1. Assignments (Total count + Max ID)
         agg_assign = assignment.objects.filter(deleted=False).aggregate(
             c=Count('id'),
