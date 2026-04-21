@@ -134,6 +134,7 @@ class forum_entry(models.Model):
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='pending', db_index=True)
     
     sender_role = models.CharField(max_length=20, default='user', db_index=True) # 'user' or 'admin'
+    recipient = models.ForeignKey(app_user, related_name='received_messages', on_delete=models.CASCADE, null=True, blank=True)
     is_read = models.BooleanField(default=False, db_index=True)
 
     deleted = models.BooleanField(default=False, db_index=True)

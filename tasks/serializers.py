@@ -64,4 +64,4 @@ class ForumEntrySerializer(serializers.ModelSerializer):
     
     class Meta:
         model = forum_entry
-        fields = ['id', 'user', 'user_name', 'message', 'reply', 'status', 'sender_role', 'is_read', 'dtm_created']
+        fields = ['id', 'user', 'user_name', 'recipient', 'message', 'reply', 'status', 'sender_role', 'is_read', 'dtm_created']

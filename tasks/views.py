@@ -959,18 +959,32 @@ def create_notification(request):
 @api_view(['GET'])
 def get_forum_entries(request):
     """
-    Fetches chat messages. If user_id is provided, fetches the specific chat history.
-    Otherwise fetches all (original behavior).
+    Fetches chat messages. If user_id (target) and req_user_id (sender) are provided, 
+    fetches the private 1-to-1 history. Otherwise fetches by owner (legacy).
     """
     try:
-        user_id = request.query_params.get('user_id')
+        target_id = request.query_params.get('user_id')
+        req_id = request.query_params.get('req_user_id')
         search = request.query_params.get('search')
         page   = int(request.query_params.get('page', 1))
-        size   = int(request.query_params.get('page_size', 50)) # Larger page for chat
+        size   = int(request.query_params.get('page_size', 50))
         
         qs = forum_entry.objects.filter(deleted=False)
-        if user_id:
-            qs = qs.filter(user_id=user_id)
+        
+        if target_id and req_id:
+            # 1-to-1 History: (A->B or B->A)
+            qs = qs.filter(
+                (Q(user_id=req_id) & Q(recipient_id=target_id)) |
+                (Q(user_id=target_id) & Q(recipient_id=req_id))
+            )
+            # Legacy Fallback: include messages where req_user is admin and recipient was null
+            req_user = app_user.objects.filter(id=req_id).first()
+            if req_user and req_user.role.lower() in ['admin', 'manager']:
+                legacy = forum_entry.objects.filter(user_id=target_id, recipient__isnull=True, deleted=False)
+                qs = (qs | legacy).distinct()
+        elif target_id:
+            # Legacy Behavior: only by owner
+            qs = qs.filter(user_id=target_id)
             
         pager = paginate_and_search(qs.order_by('dtm_created'), page, size, search, ['message', 'user__name'])
         
@@ -985,40 +999,33 @@ def get_forum_entries(request):
 def create_forum_entry(request):
     """
     Creates a chat message. 
-    `user_id` is the 'Chat Owner' (the employee/student).
-    `sender_role` identifies if it's the employee or an admin.
-    
-    Example Payload:
-    {
-        "user_id": "2",
-        "message": "Hello Administrator",
-        "sender_role": "user"
-    }
+    `user_id` in payload = Recipient.
+    `req_user_id` in payload = Sender.
     """
-    user_id = request.data.get('user_id')
-    message = request.data.get('message')
-    role    = request.data.get('sender_role', 'user')
+    recipient_id = request.data.get('user_id')
+    sender_id    = request.data.get('req_user_id') or request.data.get('admin_id')
+    message      = request.data.get('message')
+    role         = request.data.get('sender_role', 'user')
+    
     try:
-        user = app_user.objects.get(id=user_id)
-        # Mark as unread initially for the recipient
-        is_read = False
-        forum_entry.objects.create(user=user, message=message, sender_role=role, is_read=is_read)
+        sender = app_user.objects.get(id=sender_id)
+        recipient = app_user.objects.get(id=recipient_id)
         
-        # 🔔 IMMEDIATE NOTIFICATION
-        if role == 'user':
-            # Notify Admin (user_id=1)
-            notification.objects.create(
-                user_id=1, 
-                title="NEW COMMUNITY MESSAGE", 
-                message=f"💬 {user.name} sent a message: {message[:50]}..."
-            )
-        else:
-            # Notify Employee (the user_id targeted in the chat)
-            notification.objects.create(
-                user=user, 
-                title="COMMUNITY REPLY", 
-                message=f"💬 Management replied: {message[:50]}..."
-            )
+        # Create 1-to-1 Entry
+        forum_entry.objects.create(
+            user=sender, 
+            recipient=recipient, 
+            message=message, 
+            sender_role=role, 
+            is_read=False
+        )
+        
+        # 🔔 NOTIFY RECIPIENT
+        _add_notif_logic(
+            recipient.id, 
+            "NEW MESSAGE", 
+            f"💬 {sender.name} sent a message: {message[:50]}..."
+        )
 
         return Response({"status": "success"})
     except Exception as e:
@@ -1027,33 +1034,63 @@ def create_forum_entry(request):
 @api_view(['GET'])
 def get_chat_users(request):
     """
-    Returns a list of ALL users (directory), with unread message counts and latest activity prioritized.
-    Used by Admins to manage support chats.
+    Returns a list of users for chatting.
+    Students see Admins + Their Assignment Managers.
+    Admins/Managers see everyone they interated with.
     """
     req_user_id = request.query_params.get('req_user_id')
-    permitted, req_user = _check_permission(req_user_id)
     
-    if not permitted:
-        return Response({"status": "error", "message": "Permission denied"}, status=403)
+    # Allow all active users to access their own chat directory
+    req_user = app_user.objects.filter(id=req_user_id, deleted=False).first()
+    if not req_user:
+        return Response({"status": "error", "message": "User not found or access denied"}, status=403)
 
     try:
-        # Get all users who are not deleted and not the requester themselves
         role = str(req_user.role).lower()
-        users = app_user.objects.filter(deleted=False).exclude(id=req_user.id)
+        active_qs = app_user.objects.filter(deleted=False).exclude(id=req_user.id)
         
         if role == 'employee' or role == 'user':
-            # Employees can only see Admins and Managers
-            users = users.filter(role__in=['admin', 'manager'])
-        elif role == 'manager':
-            # Managers see everyone (Admins, other Managers, Employees)
-            pass
+            # 1. Show all Admins
+            admins_qs = active_qs.filter(role__iexact='admin')
+            
+            # 2. Show Managers who assigned tasks to this student
+            my_assigner_names = assignment.objects.filter(
+                assigned_to=req_user, 
+                deleted=False
+            ).values_list('assigned_by', flat=True).distinct()
+            
+            managers_qs = active_qs.filter(
+                role__iexact='manager', 
+                name__in=my_assigner_names
+            )
+            
+            users = (admins_qs | managers_qs).distinct()
+        else:
+            # Admins/Managers see everybody to allow wider support
+            users = active_qs
         
         result = []
         for u in users:
-            # unread_count: messages sent by 'user' (employee) that haven't been read by admin
-            unread_count = forum_entry.objects.filter(user=u, sender_role='user', is_read=False, deleted=False).count()
-            last_msg = forum_entry.objects.filter(user=u, deleted=False).order_by('-dtm_created').first()
+            # unread_count: messages FROM (u) TO (me)
+            unread_count = forum_entry.objects.filter(
+                user=u, 
+                recipient=req_user, 
+                is_read=False, 
+                deleted=False
+            ).count()
             
+            # last_msg: latest in 1-to-1 conversation
+            last_msg = forum_entry.objects.filter(
+                deleted=False
+            ).filter(
+                (Q(user=u, recipient=req_user) | Q(user=req_user, recipient=u))
+            ).order_by('-dtm_created').first()
+            
+            # Legacy Fallback for Admins
+            if last_msg is None and role in ['admin', 'manager']:
+                 last_msg = forum_entry.objects.filter(user=u, recipient__isnull=True, deleted=False).order_by('-dtm_created').first()
+                 unread_count = forum_entry.objects.filter(user=u, recipient__isnull=True, sender_role='user', is_read=False, deleted=False).count()
+
             result.append({
                 "id": u.id,
                 "name": u.name,
@@ -1065,10 +1102,7 @@ def get_chat_users(request):
                 "last_seen": u.last_seen
             })
             
-        # Sort logic: 
-        # 1. Unread count (desc)
-        # 2. Activity Time (desc) - use timestamp or 0 if None
-        # 3. Name (asc) - handled by reversing the specific keys
+        # Sort by unread count first, then by activity
         result.sort(key=lambda x: (
             x['unread_count'], 
             x['last_time'].timestamp() if x['last_time'] else 0
@@ -1082,16 +1116,22 @@ def get_chat_users(request):
 @api_view(['POST'])
 def mark_forum_read(request):
     """
-    Marks all messages in a specific user's chat as read by the admin.
-    
-    Example Payload:
-    {
-        "user_id": "2"
-    }
+    Marks messages from other_user to me as read.
     """
-    user_id = request.data.get('user_id')
+    other_user_id = request.data.get('user_id')
+    req_user_id   = request.data.get('req_user_id')
     try:
-        forum_entry.objects.filter(user_id=user_id, sender_role='user', is_read=False).update(is_read=True)
+        forum_entry.objects.filter(
+            user_id=other_user_id, 
+            recipient_id=req_user_id, 
+            is_read=False
+        ).update(is_read=True)
+        
+        # Legacy Fallback
+        req_user = app_user.objects.filter(id=req_user_id, deleted=False).first()
+        if req_user and req_user.role.lower() in ['admin', 'manager']:
+            forum_entry.objects.filter(user_id=other_user_id, recipient__isnull=True, is_read=False).update(is_read=True)
+
         return Response({"status": "success"})
     except Exception as e:
         return Response({"status": "error", "message": str(e)}, status=400)
