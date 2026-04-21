@@ -9,13 +9,17 @@ class UserSerializer(serializers.ModelSerializer):
 
 class TaskTemplateSerializer(serializers.ModelSerializer):
     priority = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
     
     def get_priority(self, obj):
         return obj.priority.name if obj.priority else 'None'
     
+    def get_status(self, obj):
+        return obj.status.name if obj.status else 'Pending'
+    
     class Meta:
         model = task_management
-        fields = ['id', 'title', 'description', 'priority', 'dtm_created']
+        fields = ['id', 'title', 'description', 'priority', 'status', 'dtm_created']
 
 class AssignmentSerializer(serializers.ModelSerializer):
     task_title = serializers.CharField(source='task.title', read_only=True)

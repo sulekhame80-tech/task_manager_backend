@@ -223,7 +223,8 @@ def get_master_data(request):
         data = {
             "statuses": list(statusoption.objects.values_list('name', flat=True)),
             "priorities": list(priorityoption.objects.values_list('name', flat=True)),
-            "roles": ["admin", "manager", "employee"], # Fixed roles for safety
+            # Roles are static system constants — not stored in DB
+            "roles": ["admin", "manager", "employee"],
             "server_time": datetime.now().isoformat()
         }
         return Response(data)
@@ -234,18 +235,25 @@ def get_master_data(request):
 @api_view(['POST'])
 def update_master_data(request):
     """
-    Updates the available options for Status or Priority.
+    Updates the available options for Status, Priority, or Role.
     
     Example Payload:
     {
         "type": "status",
-        "options": ["Pending", "In Progress", "Completed", "Overdue", "Awaiting Approval"]
+        "options": [ ]
     }
     """
-    data_type = request.data.get('type')   # 'status' | 'priority'
+    data_type = str(request.data.get('type', '')).lower()   # 'status' | 'priority'
     options   = request.data.get('options', [])
-    
-    model_map = {'status': statusoption, 'priority': priorityoption}
+
+    # Roles are static — cannot be modified via this endpoint
+    if data_type == 'role':
+        return Response({"status": "error", "message": "Roles are fixed system constants and cannot be modified."}, status=403)
+
+    model_map = {
+        'status': statusoption,
+        'priority': priorityoption,
+    }
     Model = model_map.get(data_type)
     
     if not Model:
@@ -559,6 +567,9 @@ def update_task_template(request):
             if field == 'priority':
                 p, _ = priorityoption.objects.get_or_create(name=value)
                 task.priority = p
+            elif field == 'status':
+                s, _ = statusoption.objects.get_or_create(name=value)
+                task.status = s
             elif hasattr(task, field):
                 setattr(task, field, value)
         

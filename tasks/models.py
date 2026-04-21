@@ -21,6 +21,7 @@ class priorityoption(models.Model):
 
 
 
+
 # user
 class app_user(models.Model):
     name = models.CharField(max_length=255)
