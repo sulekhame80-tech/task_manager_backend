@@ -610,25 +610,36 @@ def update_task_template(request):
 def delete_task_template(request):
     """
     Soft deletes a task template.
-    
-    Example Payload:
-    {
-        "task_id": "1"
-    }
+    Authorization: Admin/Manager only.
     """
     task_id = request.data.get('task_id')
+    req_user_id = request.data.get('req_user_id') or request.data.get('admin_id')
+    
+    _log("TASK-DELETE", f"Attempt delete task_id={task_id} by={req_user_id}")
+
+    # 1. Authorisation Check
+    permitted, req_user = _check_permission(req_user_id)
+    if not permitted:
+        return Response({"status": "error", "message": "Permission denied: Only Admins and Managers can delete tasks."}, status=403)
+
+    # 2. Numeric Validation (Safety for Render DB)
+    if not str(task_id).strip().isdigit():
+         return Response({"status": "error", "message": f"Invalid task_id: '{task_id}'"}, status=400)
+
     try:
         updated_template = task_management.objects.filter(id=task_id, deleted=False).update(deleted=True)
-        # 🛡️ CASCADE: Also soft-delete all assignments linked to this template to prevent dangling tasks
+        # 🛡️ CASCADE: Also soft-delete all assignments linked to this template
         updated_assignments = assignment.objects.filter(task_id=task_id, deleted=False).update(deleted=True)
         
         if not updated_template and not updated_assignments:
+            _log("TASK-DELETE", f"⚠ Not found or already deleted: {task_id}")
             return Response({"status": "error", "message": "Task not found or already deleted"}, status=404)
             
+        _log("TASK-DELETE", f"✅ Success: Deleted template {task_id} and associated assignments.")
         return Response({"status": "success"})
     except Exception as e:
         _err("TASK-DELETE", str(e), exc=True)
-        return Response({"status": "error", "message": str(e)}, status=400)
+        return Response({"status": "error", "message": str(e)}, status=500)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASSIGNMENTS (STEP 4)
@@ -822,22 +833,33 @@ def update_assignment(request):
 @api_view(['POST'])
 def delete_assignment(request):
     """
-    Soft deletes an assignment.
-    
-    Example Payload:
-    {
-        "assignment_id": "1"
-    }
+    Soft deletes an assignment (Untasks a user).
+    Authorization: Admin/Manager only.
     """
     assign_id = request.data.get('assignment_id') or request.data.get('id')
+    req_user_id = request.data.get('req_user_id') or request.data.get('admin_id')
+
+    _log("ASSIGN-DELETE", f"Attempt delete id={assign_id} by={req_user_id}")
+
+    # 1. Authorisation Check
+    permitted, req_user = _check_permission(req_user_id)
+    if not permitted:
+        return Response({"status": "error", "message": "Permission denied: Only Admins and Managers can cancel assignments."}, status=403)
+
+    # 2. Numeric Validation
+    if not str(assign_id).strip().isdigit():
+         return Response({"status": "error", "message": f"Invalid assignment_id: '{assign_id}'"}, status=400)
+
     try:
         updated = assignment.objects.filter(id=assign_id, deleted=False).update(deleted=True)
         if not updated:
             return Response({"status": "error", "message": "Assignment not found"}, status=404)
+            
+        _log("ASSIGN-DELETE", f"✅ Success: Deleted assignment {assign_id}")
         return Response({"status": "success"})
     except Exception as e:
         _err("ASSIGN-DELETE", str(e), exc=True)
-        return Response({"status": "error", "message": str(e)}, status=400)
+        return Response({"status": "error", "message": str(e)}, status=500)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATS (STEP 5)
@@ -1314,12 +1336,13 @@ def _run_overdue_check_logic():
     Can be called from views or background workers.
     """
     now = timezone.now()
+    # Logic: Only overdue if the deadline passed BEFORE today started (Next-day logic)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         overdue_status, _ = statusoption.objects.get_or_create(name='Overdue')
-        # Logic: deadline < now AND status NOT completed
         qs = assignment.objects.filter(
             deleted=False, 
-            deadline__lt=now
+            deadline__lt=today_start
         ).exclude(status__name__iexact='Completed').exclude(status__name__iexact='Overdue')
         
         for asgn in qs:
