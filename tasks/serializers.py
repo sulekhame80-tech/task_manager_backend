@@ -19,7 +19,7 @@ class TaskTemplateSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = task_management
-        fields = ['id', 'title', 'description', 'priority', 'status', 'dtm_created']
+        fields = ['id', 'title', 'description', 'priority', 'status', 'created_by', 'dtm_created']
 
 class AssignmentSerializer(serializers.ModelSerializer):
     task_title = serializers.CharField(source='task.title', read_only=True)
